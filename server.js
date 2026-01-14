@@ -869,6 +869,52 @@ app.post("/safety/emergency", async (req, res) => {
   }
 });
 
+/* =====================  HUCHAS ===================== */
+
+app.get("/piggybanks/summary", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        p.id,
+        p.name,
+        p.type,
+        COALESCE(SUM(e.amount), 0)::int AS balance,
+        COUNT(e.id)::int AS entries_count,
+        MAX(e.date_time) AS last_entry_at
+      FROM economia.piggy_bank p
+      LEFT JOIN economia.piggy_bank_entry e ON e.piggy_bank_id = p.id
+      GROUP BY p.id, p.name, p.type
+      ORDER BY p.type ASC
+    `);
+
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /piggybanks/summary:", error);
+    res.status(500).json({ error: "Error obteniendo resumen de huchas" });
+  }
+});
+
+app.get("/piggybanks/:id/entries", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `SELECT *
+       FROM economia.piggy_bank_entry
+       WHERE piggy_bank_id = $1
+       ORDER BY date_time DESC`,
+      [id]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /piggybanks/:id/entries:", error);
+    res.status(500).json({ error: "Error obteniendo entradas de la hucha" });
+  }
+});
+
+
+
 /* ===================== BOOT ===================== */
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`✅ Servidor corriendo en puerto ${PORT}`));
