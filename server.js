@@ -263,6 +263,158 @@ app.get("/month/current", async (_req, res) => {
   }
 });
 
+app.get("/week/current", async (_req, res) => {
+  try {
+    // Mes OPEN
+    const m = await pool.query(
+      `SELECT * FROM economia.month WHERE status='OPEN' ORDER BY created_at DESC LIMIT 1`
+    );
+    if (!m.rows.length) return res.json(null);
+
+    const month = m.rows[0];
+
+    // Semana donde hoy (CURRENT_DATE) está dentro del rango de la semana
+    const w = await pool.query(
+      `SELECT *
+       FROM economia.week
+       WHERE month_id = $1
+         AND start_date <= CURRENT_DATE
+         AND end_date >= CURRENT_DATE
+       ORDER BY week_index ASC
+       LIMIT 1`,
+      [month.id]
+    );
+
+    // Si por lo que sea hoy no cae en ninguna (ej: start_date del mes no incluye hoy),
+    // devolvemos la última semana creada del mes.
+    if (!w.rows.length) {
+      const fallback = await pool.query(
+        `SELECT *
+         FROM economia.week
+         WHERE month_id = $1
+         ORDER BY week_index DESC
+         LIMIT 1`,
+        [month.id]
+      );
+      return res.json(fallback.rows[0] || null);
+    }
+
+    res.json(w.rows[0]);
+  } catch (error) {
+    console.error("❌ Error en GET /week/current:", error);
+    res.status(500).json({ error: "Error obteniendo semana actual" });
+  }
+});
+
+app.get("/summary/current", async (_req, res) => {
+  try {
+    // Mes OPEN
+    const m = await pool.query(
+      `SELECT * FROM economia.month WHERE status='OPEN' ORDER BY created_at DESC LIMIT 1`
+    );
+    if (!m.rows.length) return res.json(null);
+
+    const month = m.rows[0];
+
+    // Semana actual
+    const w = await pool.query(
+      `SELECT *
+       FROM economia.week
+       WHERE month_id = $1
+         AND start_date <= CURRENT_DATE
+         AND end_date >= CURRENT_DATE
+       ORDER BY week_index ASC
+       LIMIT 1`,
+      [month.id]
+    );
+    const week = w.rows[0] || null;
+
+    // Totales del mes
+    const totals = await pool.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN direction='OUT' AND type='EXPENSE' THEN amount ELSE 0 END),0)::int AS total_expenses,
+         COALESCE(SUM(CASE WHEN direction='IN' AND type='EXTRA_INCOME' THEN amount ELSE 0 END),0)::int AS extra_income
+       FROM economia.transaction
+       WHERE month_id = $1`,
+      [month.id]
+    );
+
+    const totalExpenses = totals.rows[0].total_expenses;
+    const extraIncome = totals.rows[0].extra_income;
+
+    const totalIncome = (month.income_amount || 0) + extraIncome;
+    const remainingMonth = totalIncome - totalExpenses;
+
+    // Gastado esta semana (si hay week)
+    let weekSpent = 0;
+    let remainingWeek = null;
+
+    if (week) {
+      const ws = await pool.query(
+        `SELECT COALESCE(SUM(amount),0)::int AS week_spent
+         FROM economia.transaction
+         WHERE month_id=$1
+           AND direction='OUT'
+           AND type='EXPENSE'
+           AND date_time::date >= $2::date
+           AND date_time::date <= $3::date`,
+        [month.id, week.start_date, week.end_date]
+      );
+      weekSpent = ws.rows[0].week_spent;
+      remainingWeek = (month.weekly_budget_amount || 0) - weekSpent;
+    }
+
+    // Split por attribution (solo gastos EXPENSE)
+    const split = await pool.query(
+      `SELECT
+         attribution,
+         COALESCE(SUM(amount),0)::int AS total
+       FROM economia.transaction
+       WHERE month_id=$1
+         AND direction='OUT'
+         AND type='EXPENSE'
+       GROUP BY attribution`,
+      [month.id]
+    );
+
+    const byAttr = { MINE: 0, PARTNER: 0, HOUSE: 0 };
+    for (const r of split.rows) {
+      if (byAttr[r.attribution] !== undefined) byAttr[r.attribution] = r.total;
+    }
+
+    // Días restantes (incluyendo hoy)
+    const daysLeftQ = await pool.query(
+      `SELECT GREATEST(1, (economia.month.end_date - CURRENT_DATE + 1))::int AS days_left
+       FROM economia.month
+       WHERE id=$1`,
+      [month.id]
+    );
+    const daysLeft = daysLeftQ.rows[0].days_left;
+    const dailyPace = remainingMonth / daysLeft;
+
+    res.json({
+      month,
+      week,
+      totals: {
+        totalIncome,
+        extraIncome,
+        totalExpenses,
+        remainingMonth,
+        weekSpent,
+        remainingWeek,
+        daysLeft,
+        dailyPace,
+        byAttr,
+      },
+    });
+  } catch (error) {
+    console.error("❌ Error en GET /summary/current:", error);
+    res.status(500).json({ error: "Error obteniendo summary" });
+  }
+});
+
+
+
 app.post("/month/start", async (req, res) => {
   const client = await pool.connect();
   try {
