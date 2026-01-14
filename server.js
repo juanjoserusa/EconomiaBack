@@ -182,6 +182,7 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_tx_category ON economia.transaction(category_id);
   `);
 
+  // Seed categorías
   const categories = [
     "Alquiler",
     "Estudios",
@@ -206,6 +207,7 @@ async function initDb() {
     );
   }
 
+  // Seed huchas
   await pool.query(
     `INSERT INTO economia.piggy_bank (name, type)
      VALUES ($1,$2)
@@ -249,7 +251,6 @@ app.get("/categories", async (_req, res) => {
 });
 
 /* ===================== MONTHS ===================== */
-// Devuelve el mes OPEN (si existe)
 app.get("/month/current", async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -262,7 +263,6 @@ app.get("/month/current", async (_req, res) => {
   }
 });
 
-// Crear mes (income, savingGoal, weeklyBudget) + genera semanas
 app.post("/month/start", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -274,7 +274,6 @@ app.post("/month/start", async (req, res) => {
       });
     }
 
-    // Si ya hay un mes OPEN, no creamos otro
     const open = await client.query(
       `SELECT id FROM economia.month WHERE status='OPEN' LIMIT 1`
     );
@@ -282,11 +281,9 @@ app.post("/month/start", async (req, res) => {
       return res.status(400).json({ error: "Ya existe un mes OPEN" });
     }
 
-    // startDate opcional (por defecto hoy)
     const start = startDate ? new Date(startDate) : new Date();
     const periodKey = toPeriodKey(start);
 
-    // endDate = último día de ese mes calendario
     const end = new Date(start.getFullYear(), start.getMonth() + 1, 0);
 
     await client.query("BEGIN");
@@ -318,7 +315,6 @@ app.post("/month/start", async (req, res) => {
       const wStart = cursor;
       const wEnd = addDays(wStart, 6);
 
-      // Intersección con el rango del mes (start..end)
       const rangeStart = new Date(start);
       rangeStart.setHours(0, 0, 0, 0);
 
@@ -353,7 +349,6 @@ app.post("/month/start", async (req, res) => {
   }
 });
 
-// Cerrar mes: consolida ahorro (savingGoal + sobrante) y marca CLOSED
 app.post("/month/close", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -368,7 +363,6 @@ app.post("/month/close", async (req, res) => {
     const month = m.rows[0];
     if (month.status !== "OPEN") return res.status(400).json({ error: "El mes no está OPEN" });
 
-    // Total gastos OUT (EXPENSE y pagos varios que sean OUT)
     const out = await client.query(
       `SELECT COALESCE(SUM(amount),0)::int AS total
        FROM economia.transaction
@@ -376,7 +370,6 @@ app.post("/month/close", async (req, res) => {
       [monthId]
     );
 
-    // Total ingresos extra (IN, EXTRA_INCOME)
     const extra = await client.query(
       `SELECT COALESCE(SUM(amount),0)::int AS total
        FROM economia.transaction
@@ -384,17 +377,12 @@ app.post("/month/close", async (req, res) => {
       [monthId]
     );
 
-    // Ingreso base + extras
     const totalIncome = month.income_amount + extra.rows[0].total;
-
-    // Disponible tras gastos
     const remainder = totalIncome - out.rows[0].total;
 
-    // A consolidar = saving goal + (resto - saving goal si hay)
-    // Si remainder < savingGoal => consolidamos lo que se pueda (sin negativo)
-    const toConsolidate = Math.max(0, Math.min(remainder, month.saving_goal_amount) + Math.max(0, remainder - month.saving_goal_amount));
+    // A consolidar = todo lo que queda (si es positivo). Si queda 0 o negativo, 0.
+    const toConsolidate = Math.max(0, remainder);
 
-    // Insert tx consolidate (si hay)
     if (toConsolidate > 0) {
       await client.query(
         `INSERT INTO economia.transaction
@@ -404,7 +392,6 @@ app.post("/month/close", async (req, res) => {
       );
     }
 
-    // Cerrar mes
     const closed = await client.query(
       `UPDATE economia.month
        SET status='CLOSED', closed_at=NOW()
@@ -433,7 +420,6 @@ app.post("/month/close", async (req, res) => {
 });
 
 /* ===================== WEEKS ===================== */
-// Devolver billetes al banco (cash return) + registra transacción
 app.post("/weeks/:id/cash-return", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -449,7 +435,6 @@ app.post("/weeks/:id/cash-return", async (req, res) => {
 
     const week = w.rows[0];
 
-    // suma al acumulado de devuelto a banco
     const up = await client.query(
       `UPDATE economia.week
        SET cash_returned_to_bank_amount = cash_returned_to_bank_amount + $1
@@ -458,7 +443,6 @@ app.post("/weeks/:id/cash-return", async (req, res) => {
       [parseInt(amount, 10), id]
     );
 
-    // registra transacción CASH_RETURN (no es ingreso real)
     await client.query(
       `INSERT INTO economia.transaction
         (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note)
@@ -540,9 +524,7 @@ app.post("/transactions", async (req, res) => {
 app.get("/transactions", async (req, res) => {
   try {
     const { monthId } = req.query;
-    if (!monthId) {
-      return res.status(400).json({ error: "monthId es obligatorio" });
-    }
+    if (!monthId) return res.status(400).json({ error: "monthId es obligatorio" });
 
     const { rows } = await pool.query(
       `SELECT
@@ -559,6 +541,97 @@ app.get("/transactions", async (req, res) => {
   } catch (error) {
     console.error("❌ Error en GET /transactions:", error);
     res.status(500).json({ error: "Error obteniendo transacciones" });
+  }
+});
+
+/* ===== NUEVO: GET/PUT/DELETE para editar/borrar ===== */
+app.get("/transactions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `SELECT t.*, c.name AS category_name
+       FROM economia.transaction t
+       LEFT JOIN economia.category c ON c.id = t.category_id
+       WHERE t.id = $1
+       LIMIT 1`,
+      [id]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("❌ Error en GET /transactions/:id:", error);
+    res.status(500).json({ error: "Error obteniendo movimiento" });
+  }
+});
+
+app.put("/transactions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      date_time,
+      amount,
+      category_id,
+      attribution,
+      payment_method,
+      concept,
+      note,
+    } = req.body;
+
+    if (!amount || !attribution || !payment_method) {
+      return res.status(400).json({
+        error: "amount, attribution y payment_method son obligatorios",
+      });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE economia.transaction
+       SET
+         date_time = COALESCE($1, date_time),
+         amount = $2,
+         category_id = $3,
+         attribution = $4::economia.attribution,
+         payment_method = $5::economia.payment_method,
+         concept = $6,
+         note = $7
+       WHERE id = $8
+       RETURNING *`,
+      [
+        date_time || null,
+        parseInt(amount, 10),
+        category_id || null,
+        attribution,
+        payment_method,
+        concept || null,
+        note || null,
+        id,
+      ]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("❌ Error en PUT /transactions/:id:", error);
+    res.status(500).json({ error: "Error editando movimiento" });
+  }
+});
+
+app.delete("/transactions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const r = await pool.query(
+      `DELETE FROM economia.transaction WHERE id=$1 RETURNING id`,
+      [id]
+    );
+
+    if (!r.rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("❌ Error en DELETE /transactions/:id:", error);
+    res.status(500).json({ error: "Error borrando movimiento" });
   }
 });
 
@@ -588,8 +661,7 @@ app.post("/piggybanks/:id/entries", async (req, res) => {
       [id, parseInt(amount, 10), note || null, month_id || null]
     );
 
-    // opcional: registrar también como transacción (tracking)
-    // (si no lo quieres, quítalo)
+    // Opcional: registrar también como transacción (tracking)
     if (month_id) {
       await pool.query(
         `INSERT INTO economia.transaction
@@ -612,7 +684,6 @@ app.get("/safety/balance", async (_req, res) => {
     const { rows } = await pool.query(
       `SELECT
          COALESCE(SUM(CASE WHEN type='CONSOLIDATE_TO_SAFETY' THEN amount ELSE 0 END),0)::int
-         + COALESCE(SUM(CASE WHEN type='EXTRA_INCOME' THEN amount ELSE 0 END),0)::int
          - COALESCE(SUM(CASE WHEN type='EMERGENCY_FROM_SAFETY' THEN amount ELSE 0 END),0)::int
          AS balance
        FROM economia.transaction`
@@ -624,7 +695,6 @@ app.get("/safety/balance", async (_req, res) => {
   }
 });
 
-// Usar fondo de seguridad (mover a operativo)
 app.post("/safety/emergency", async (req, res) => {
   try {
     const { month_id, amount, note } = req.body;
