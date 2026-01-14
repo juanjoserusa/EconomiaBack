@@ -897,6 +897,144 @@ app.get("/safety/history", async (req, res) => {
   }
 });
 
+/* ===================== BORRAR MESES ===================== */
+
+app.delete("/month/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+
+    await client.query("BEGIN");
+
+    // Comprueba que existe
+    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
+    if (!m.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Mes no encontrado" });
+    }
+
+    // Borra el mes:
+    // - weeks se borran por ON DELETE CASCADE
+    // - transactions del mes se borran por ON DELETE CASCADE
+    // - piggy_bank_entry month_id pasa a NULL por ON DELETE SET NULL
+    await client.query(`DELETE FROM economia.month WHERE id=$1`, [id]);
+
+    await client.query("COMMIT");
+
+    res.json({ ok: true, deletedMonthId: id });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error en DELETE /month/:id:", error);
+    res.status(500).json({ error: "Error borrando el mes" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/months", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         id,
+         period_key,
+         start_date,
+         end_date,
+         income_amount,
+         weekly_budget_amount,
+         saving_goal_amount,
+         status,
+         created_at,
+         closed_at
+       FROM economia.month
+       ORDER BY start_date DESC`
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /months:", error);
+    res.status(500).json({ error: "Error obteniendo meses" });
+  }
+});
+
+app.put("/month/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { incomeAmount, savingGoalAmount, weeklyBudgetAmount } = req.body;
+
+    // al menos uno debe venir
+    if (
+      incomeAmount === undefined &&
+      savingGoalAmount === undefined &&
+      weeklyBudgetAmount === undefined
+    ) {
+      return res.status(400).json({
+        error: "Debes enviar incomeAmount, savingGoalAmount o weeklyBudgetAmount (al menos uno).",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
+    if (!m.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Mes no encontrado" });
+    }
+
+    const month = m.rows[0];
+
+    // No bloqueamos por status: puedes corregir incluso CLOSED si quieres.
+    // Si prefieres bloquear CLOSED, dímelo y lo hacemos.
+
+    const newIncome =
+      incomeAmount === undefined ? month.income_amount : parseInt(incomeAmount, 10);
+    const newSaving =
+      savingGoalAmount === undefined ? month.saving_goal_amount : parseInt(savingGoalAmount, 10);
+    const newWeekly =
+      weeklyBudgetAmount === undefined ? month.weekly_budget_amount : parseInt(weeklyBudgetAmount, 10);
+
+    if (!Number.isFinite(newIncome) || newIncome < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "incomeAmount inválido" });
+    }
+    if (!Number.isFinite(newSaving) || newSaving < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "savingGoalAmount inválido" });
+    }
+    if (!Number.isFinite(newWeekly) || newWeekly < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "weeklyBudgetAmount inválido" });
+    }
+
+    const up = await client.query(
+      `UPDATE economia.month
+       SET income_amount=$1,
+           saving_goal_amount=$2,
+           weekly_budget_amount=$3
+       WHERE id=$4
+       RETURNING *`,
+      [newIncome, newSaving, newWeekly, id]
+    );
+
+    // Si cambia el weekly budget, actualiza semanas OPEN (no tocamos las CLOSED)
+    if (weeklyBudgetAmount !== undefined && newWeekly !== month.weekly_budget_amount) {
+      await client.query(
+        `UPDATE economia.week
+         SET cash_withdraw_amount=$1
+         WHERE month_id=$2 AND status='OPEN'`,
+        [newWeekly, id]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json(up.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error en PUT /month/:id:", error);
+    res.status(500).json({ error: "Error actualizando el mes" });
+  } finally {
+    client.release();
+  }
+});
 
 /* =====================  HUCHAS ===================== */
 
