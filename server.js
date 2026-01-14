@@ -869,6 +869,35 @@ app.post("/safety/emergency", async (req, res) => {
   }
 });
 
+app.get("/safety/history", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
+
+    const { rows } = await pool.query(
+      `SELECT
+         id,
+         date_time,
+         amount,
+         direction,
+         type,
+         month_id,
+         concept,
+         note
+       FROM economia.transaction
+       WHERE type IN ('CONSOLIDATE_TO_SAFETY','EMERGENCY_FROM_SAFETY')
+       ORDER BY date_time DESC
+       LIMIT $1`,
+      [limit]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /safety/history:", error);
+    res.status(500).json({ error: "Error obteniendo histórico del fondo" });
+  }
+});
+
+
 /* =====================  HUCHAS ===================== */
 
 app.get("/piggybanks/summary", async (_req, res) => {
