@@ -206,6 +206,110 @@ initDb().catch((err) => {
 /* ===================== ROUTES ===================== */
 app.get("/", (_req, res) => res.send("Economia API funcionando correctamente"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+/* ===================== CATEGORIES ===================== */
+app.get("/categories", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, is_active, created_at
+       FROM economia.category
+       WHERE is_active = true
+       ORDER BY name ASC`
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /categories:", error);
+    res.status(500).json({ error: "Error obteniendo categorías" });
+  }
+});
+
+/* ===================== TRANSACTIONS ===================== */
+// Crear transacción (gasto normal, etc.)
+app.post("/transactions", async (req, res) => {
+  try {
+    const {
+      date_time,       // opcional (si no viene, NOW())
+      amount,          // requerido
+      type,            // 'EXPENSE' por defecto
+      direction,       // 'OUT' por defecto
+      month_id,        // requerido
+      week_id,         // opcional
+      category_id,     // requerido si EXPENSE
+      attribution,     // requerido: MINE | PARTNER | HOUSE
+      payment_method,  // requerido: CARD | CASH | TRANSFER
+      concept,         // opcional
+      note             // opcional
+    } = req.body;
+
+    if (!amount || !month_id || !attribution || !payment_method) {
+      return res.status(400).json({
+        error: "amount, month_id, attribution y payment_method son obligatorios",
+      });
+    }
+
+    const finalType = type || "EXPENSE";
+    const finalDirection = direction || "OUT";
+
+    if (finalType === "EXPENSE" && !category_id) {
+      return res.status(400).json({
+        error: "category_id es obligatorio cuando type=EXPENSE",
+      });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO economia.transaction
+        (date_time, amount, direction, type, month_id, week_id, category_id, attribution, payment_method, concept, note)
+       VALUES
+        (COALESCE($1, NOW()), $2, $3, $4::economia.tx_type, $5, $6, $7, $8::economia.attribution, $9::economia.payment_method, $10, $11)
+       RETURNING *`,
+      [
+        date_time || null,
+        parseInt(amount, 10),
+        finalDirection,
+        finalType,
+        month_id,
+        week_id || null,
+        category_id || null,
+        attribution,
+        payment_method,
+        concept || null,
+        note || null,
+      ]
+    );
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("❌ Error en POST /transactions:", error);
+    res.status(500).json({ error: "Error creando transacción" });
+  }
+});
+
+app.get("/transactions", async (req, res) => {
+  try {
+    const { monthId } = req.query;
+    if (!monthId) {
+      return res.status(400).json({ error: "monthId es obligatorio" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT
+         t.*,
+         c.name AS category_name
+       FROM economia.transaction t
+       LEFT JOIN economia.category c ON c.id = t.category_id
+       WHERE t.month_id = $1
+       ORDER BY t.date_time DESC`,
+      [String(monthId)]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /transactions:", error);
+    res.status(500).json({ error: "Error obteniendo transacciones" });
+  }
+});
+
+
+
 
 /* ===================== BOOT ===================== */
 const PORT = process.env.PORT || 3001;
