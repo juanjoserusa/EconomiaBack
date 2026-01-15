@@ -92,6 +92,9 @@ function addDays(date, n) {
 async function ensureCashWithdrawalForWeek(client, week) {
   if (!week?.id) return;
 
+  // Si el presupuesto semanal es 0, no hace falta retirar nada
+  if (!week.cash_withdraw_amount || week.cash_withdraw_amount <= 0) return;
+
   const exists = await client.query(
     `SELECT 1
      FROM economia.transaction
@@ -109,7 +112,7 @@ async function ensureCashWithdrawalForWeek(client, week) {
      VALUES
       ($1, $2, 'OUT', 'CASH_WITHDRAWAL', $3, $4, 'HOUSE', 'TRANSFER', $5, NULL)`,
     [
-      new Date(week.start_date), // lunes de esa semana
+      new Date(week.start_date), // inicio de la semana (en tu tabla puede ser parcial, pero es “la semana vigente”)
       week.cash_withdraw_amount,
       week.month_id,
       week.id,
@@ -427,7 +430,7 @@ app.get("/summary/current", async (_req, res) => {
       }
     }
 
-    // Totales del mes (céntimos) - mantenemos tu lógica
+    // Totales del mes (céntimos): GASTOS = EXPENSE (da igual método)
     const totalsQ = await pool.query(
       `SELECT
          COALESCE(SUM(CASE WHEN direction='OUT' AND type='EXPENSE' THEN amount ELSE 0 END),0)::int AS total_expenses,
@@ -442,26 +445,27 @@ app.get("/summary/current", async (_req, res) => {
     const totalIncome = (month.income_amount || 0) + extraIncome; // cents
     const remainingMonth = totalIncome - totalExpenses; // cents
 
-    // Gastado esta semana (céntimos) (tu lógica)
-    let weekSpent = 0;
-    let remainingWeek = null;
+    // ✅ Semana: SOLO gasto CASH (porque el presupuesto semanal es efectivo)
+    let weekSpentCash = 0;
+    let remainingWeekCash = null;
 
     if (week) {
       const ws = await pool.query(
-        `SELECT COALESCE(SUM(amount),0)::int AS week_spent
+        `SELECT COALESCE(SUM(amount),0)::int AS week_spent_cash
          FROM economia.transaction
          WHERE month_id=$1
            AND direction='OUT'
            AND type='EXPENSE'
+           AND payment_method='CASH'
            AND date_time::date >= $2::date
            AND date_time::date <= $3::date`,
         [month.id, week.start_date, week.end_date]
       );
-      weekSpent = ws.rows[0].week_spent; // cents
-      remainingWeek = (month.weekly_budget_amount || 0) - weekSpent; // cents
+      weekSpentCash = ws.rows[0].week_spent_cash; // cents
+      remainingWeekCash = (week.cash_withdraw_amount || 0) - weekSpentCash; // cents
     }
 
-    // Split por attribution (solo gastos EXPENSE) (céntimos)
+    // Split por attribution (solo gastos EXPENSE) (céntimos) (da igual método, esto es “quién paga”)
     const split = await pool.query(
       `SELECT
          attribution,
@@ -490,14 +494,10 @@ app.get("/summary/current", async (_req, res) => {
 
     const dailyPace = remainingMonth / daysLeft;
 
-    // ===================== ✅ NUEVO: BANK vs CASH =====================
+    // ===================== ✅ BANK vs CASH =====================
     // bankStart = income_amount + extra_income (todo entra en banco)
     // bankOut = gastos CARD/TRANSFER + retiradas CASH_WITHDRAWAL
     // bankIn = devoluciones CASH_RETURN
-    //
-    // cashStart = 0
-    // cashIn = retiradas CASH_WITHDRAWAL
-    // cashOut = gastos CASH + devoluciones CASH_RETURN + piggy deposits (si están como CASH)
     const bankAgg = await pool.query(
       `SELECT
         COALESCE(SUM(CASE WHEN type='EXTRA_INCOME' THEN amount ELSE 0 END),0)::int AS extra_in,
@@ -526,7 +526,8 @@ app.get("/summary/current", async (_req, res) => {
     const bankBalance = bankStart + bankIn - bankOut;
 
     const cashIn = cashAgg.rows[0].withdraw_in;
-    const cashOut = cashAgg.rows[0].cash_expenses_out + cashAgg.rows[0].return_out + cashAgg.rows[0].piggy_out;
+    const cashOut =
+      cashAgg.rows[0].cash_expenses_out + cashAgg.rows[0].return_out + cashAgg.rows[0].piggy_out;
     const cashBalance = cashIn - cashOut;
 
     res.json({
@@ -538,8 +539,11 @@ app.get("/summary/current", async (_req, res) => {
         extraIncome,
         totalExpenses,
         remainingMonth,
-        weekSpent,
-        remainingWeek,
+
+        // ✅ semana cash
+        weekSpent: weekSpentCash,
+        remainingWeek: remainingWeekCash,
+
         daysLeft,
         dailyPace,
         byAttr,
@@ -549,8 +553,11 @@ app.get("/summary/current", async (_req, res) => {
         extraIncome_eur: centsToEur(extraIncome),
         totalExpenses_eur: centsToEur(totalExpenses),
         remainingMonth_eur: centsToEur(remainingMonth),
-        weekSpent_eur: centsToEur(weekSpent),
-        remainingWeek_eur: remainingWeek === null ? null : centsToEur(remainingWeek),
+
+        // ✅ semana cash eur
+        weekSpent_eur: centsToEur(weekSpentCash),
+        remainingWeek_eur: remainingWeekCash === null ? null : centsToEur(remainingWeekCash),
+
         dailyPace_eur: Number.isFinite(dailyPace) ? dailyPace / 100 : 0,
         byAttr_eur: {
           MINE: centsToEur(byAttr.MINE),
@@ -559,7 +566,6 @@ app.get("/summary/current", async (_req, res) => {
         },
       },
 
-      // ✅ nuevo: para que Home pinte banco vs bolsillo
       balances: {
         bank: bankBalance,
         bank_eur: centsToEur(bankBalance),
@@ -593,9 +599,15 @@ app.post("/month/start", async (req, res) => {
     const savingCents = parseMoneyToCents(savingGoalAmount);
     const weeklyCents = parseMoneyToCents(weeklyBudgetAmount);
 
-    if (!incomeCents || !savingCents || !weeklyCents) {
+    // ✅ OJO: NO usar !incomeCents (porque 0 es falsy). Aquí queremos > 0, pero validamos bien.
+    if (incomeCents === null || savingCents === null || weeklyCents === null) {
       return res.status(400).json({
         error: "incomeAmount, savingGoalAmount y weeklyBudgetAmount son obligatorios (válidos)",
+      });
+    }
+    if (incomeCents <= 0 || savingCents < 0 || weeklyCents < 0) {
+      return res.status(400).json({
+        error: "incomeAmount debe ser > 0. savingGoalAmount y weeklyBudgetAmount deben ser >= 0.",
       });
     }
 
@@ -749,7 +761,7 @@ app.post("/weeks/:id/cash-return", async (req, res) => {
     const { amount } = req.body;
 
     const amountCents = parseMoneyToCents(amount);
-    if (!amountCents || amountCents <= 0) {
+    if (amountCents === null || amountCents <= 0) {
       return res.status(400).json({ error: "amount es obligatorio (válido)" });
     }
 
@@ -788,6 +800,41 @@ app.post("/weeks/:id/cash-return", async (req, res) => {
   }
 });
 
+/* ===================== ✅ NUEVO: INCOME EXTRA (fácil desde front) ===================== */
+app.post("/income/extra", async (req, res) => {
+  try {
+    const { month_id, amount, attribution, concept, note } = req.body;
+
+    const amountCents = parseMoneyToCents(amount);
+    if (!month_id || amountCents === null || amountCents <= 0) {
+      return res.status(400).json({ error: "month_id y amount son obligatorios (amount válido)" });
+    }
+
+    const finalAttr = attribution || "HOUSE";
+
+    const { rows } = await pool.query(
+      `INSERT INTO economia.transaction
+        (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note)
+       VALUES (NOW(), $1, 'IN', 'EXTRA_INCOME', $2, $3::economia.attribution, 'TRANSFER', $4, $5)
+       RETURNING
+         *,
+         (amount / 100.0) AS amount_eur`,
+      [
+        amountCents,
+        month_id,
+        finalAttr,
+        concept && String(concept).trim() ? String(concept).trim() : "Ingreso extra",
+        note || null,
+      ]
+    );
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("❌ Error en POST /income/extra:", error);
+    res.status(500).json({ error: "Error creando ingreso extra" });
+  }
+});
+
 /* ===================== TRANSACTIONS ===================== */
 app.post("/transactions", async (req, res) => {
   try {
@@ -807,7 +854,7 @@ app.post("/transactions", async (req, res) => {
 
     const amountCents = parseMoneyToCents(amount);
 
-    if (!amountCents || amountCents <= 0 || !month_id || !attribution || !payment_method) {
+    if (amountCents === null || amountCents <= 0 || !month_id || !attribution || !payment_method) {
       return res.status(400).json({
         error: "amount, month_id, attribution y payment_method son obligatorios (amount válido)",
       });
@@ -908,7 +955,7 @@ app.put("/transactions/:id", async (req, res) => {
 
     const amountCents = parseMoneyToCents(amount);
 
-    if (!amountCents || amountCents <= 0 || !attribution || !payment_method) {
+    if (amountCents === null || amountCents <= 0 || !attribution || !payment_method) {
       return res.status(400).json({
         error: "amount, attribution y payment_method son obligatorios (amount válido)",
       });
@@ -979,7 +1026,9 @@ app.post("/piggybanks/:id/entries", async (req, res) => {
     const { amount, note, month_id } = req.body;
 
     const amountCents = parseMoneyToCents(amount);
-    if (!amountCents || amountCents <= 0) return res.status(400).json({ error: "amount es obligatorio (válido)" });
+    if (amountCents === null || amountCents <= 0) {
+      return res.status(400).json({ error: "amount es obligatorio (válido)" });
+    }
 
     const { rows } = await pool.query(
       `INSERT INTO economia.piggy_bank_entry (piggy_bank_id, amount, note, month_id)
@@ -1032,7 +1081,7 @@ app.post("/safety/emergency", async (req, res) => {
 
     const amountCents = parseMoneyToCents(amount);
 
-    if (!month_id || !amountCents || amountCents <= 0 || !note) {
+    if (!month_id || amountCents === null || amountCents <= 0 || !note) {
       return res.status(400).json({ error: "month_id, amount y note son obligatorios (válidos)" });
     }
 
