@@ -27,6 +27,37 @@ const pool = new Pool({
 pool.on("error", (err) => console.error("❌ Error en PostgreSQL:", err));
 
 /* ===================== HELPERS ===================== */
+
+function parseMoneyToCents(input) {
+  if (input === null || input === undefined) return null;
+
+  let s = String(input).trim();
+  if (!s) return null;
+
+  // Permite "3,50" o "3.50"
+  s = s.replace(",", ".");
+
+  // Quita todo salvo dígitos y punto
+  s = s.replace(/[^\d.]/g, "");
+
+  // Si hay más de un punto, deja solo el primero
+  const firstDot = s.indexOf(".");
+  if (firstDot !== -1) {
+    s = s.slice(0, firstDot + 1) + s.slice(firstDot + 1).replace(/\./g, "");
+  }
+
+  const n = Number(s);
+  if (!Number.isFinite(n)) return null;
+
+  return Math.round(n * 100);
+}
+
+function centsToMoney(cents) {
+  if (cents === null || cents === undefined) return null;
+  return Math.round(Number(cents)) / 100;
+}
+
+
 function toPeriodKey(d = new Date()) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -630,9 +661,11 @@ app.post("/transactions", async (req, res) => {
       note,
     } = req.body;
 
-    if (!amount || !month_id || !attribution || !payment_method) {
+    const amountCents = parseMoneyToCents(amount);
+
+    if (!amountCents || amountCents <= 0 || !month_id || !attribution || !payment_method) {
       return res.status(400).json({
-        error: "amount, month_id, attribution y payment_method son obligatorios",
+        error: "amount, month_id, attribution y payment_method son obligatorios (amount válido)",
       });
     }
 
@@ -650,10 +683,12 @@ app.post("/transactions", async (req, res) => {
         (date_time, amount, direction, type, month_id, week_id, category_id, attribution, payment_method, concept, note)
        VALUES
         (COALESCE($1, NOW()), $2, $3, $4::economia.tx_type, $5, $6, $7, $8::economia.attribution, $9::economia.payment_method, $10, $11)
-       RETURNING *`,
+       RETURNING
+         *,
+         (amount / 100.0) AS amount_eur`,
       [
         date_time || null,
-        parseInt(amount, 10),
+        amountCents,
         finalDirection,
         finalType,
         month_id,
@@ -661,7 +696,7 @@ app.post("/transactions", async (req, res) => {
         category_id || null,
         attribution,
         payment_method,
-        concept || null,
+        concept && String(concept).trim() ? String(concept).trim() : null,
         note || null,
       ]
     );
@@ -673,6 +708,7 @@ app.post("/transactions", async (req, res) => {
   }
 });
 
+
 app.get("/transactions", async (req, res) => {
   try {
     const { monthId } = req.query;
@@ -681,6 +717,7 @@ app.get("/transactions", async (req, res) => {
     const { rows } = await pool.query(
       `SELECT
          t.*,
+         (t.amount / 100.0) AS amount_eur,
          c.name AS category_name
        FROM economia.transaction t
        LEFT JOIN economia.category c ON c.id = t.category_id
@@ -696,13 +733,17 @@ app.get("/transactions", async (req, res) => {
   }
 });
 
+
 /* ===== NUEVO: GET/PUT/DELETE para editar/borrar ===== */
 app.get("/transactions/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
     const { rows } = await pool.query(
-      `SELECT t.*, c.name AS category_name
+      `SELECT
+         t.*,
+         (t.amount / 100.0) AS amount_eur,
+         c.name AS category_name
        FROM economia.transaction t
        LEFT JOIN economia.category c ON c.id = t.category_id
        WHERE t.id = $1
@@ -711,12 +752,14 @@ app.get("/transactions/:id", async (req, res) => {
     );
 
     if (!rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
+
     res.json(rows[0]);
   } catch (error) {
     console.error("❌ Error en GET /transactions/:id:", error);
     res.status(500).json({ error: "Error obteniendo movimiento" });
   }
 });
+
 
 app.put("/transactions/:id", async (req, res) => {
   try {
@@ -732,9 +775,11 @@ app.put("/transactions/:id", async (req, res) => {
       note,
     } = req.body;
 
-    if (!amount || !attribution || !payment_method) {
+    const amountCents = parseMoneyToCents(amount);
+
+    if (!amountCents || amountCents <= 0 || !attribution || !payment_method) {
       return res.status(400).json({
-        error: "amount, attribution y payment_method son obligatorios",
+        error: "amount, attribution y payment_method son obligatorios (amount válido)",
       });
     }
 
@@ -749,26 +794,30 @@ app.put("/transactions/:id", async (req, res) => {
          concept = $6,
          note = $7
        WHERE id = $8
-       RETURNING *`,
+       RETURNING
+         *,
+         (amount / 100.0) AS amount_eur`,
       [
         date_time || null,
-        parseInt(amount, 10),
+        amountCents,
         category_id || null,
         attribution,
         payment_method,
-        concept || null,
+        concept && String(concept).trim() ? String(concept).trim() : null,
         note || null,
         id,
       ]
     );
 
     if (!rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
+
     res.json(rows[0]);
   } catch (error) {
     console.error("❌ Error en PUT /transactions/:id:", error);
     res.status(500).json({ error: "Error editando movimiento" });
   }
 });
+
 
 app.delete("/transactions/:id", async (req, res) => {
   try {
