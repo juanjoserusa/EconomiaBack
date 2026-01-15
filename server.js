@@ -1,3 +1,17 @@
+/**
+ * server.js (backend completo)
+ *
+ * ✅ Política dinero: TODO en BD son CÉNTIMOS (INT).
+ * ✅ Inputs: aceptan "1,60" o "1.60" (euros) y se convierten a céntimos.
+ *
+ * ✅ NUEVO (Opción B - Banco vs Efectivo):
+ *  - Añade cuenta (BANK/CASH) en transacciones
+ *  - Transferencias dobles (BANK->CASH y CASH->BANK) con transfer_group
+ *  - Lunes (inicio de semana): auto "sacar efectivo semanal" (CASH_WITHDRAWAL) si no existe
+ *  - Endpoint para devolución: /weeks/:id/cash-return crea doble apunte
+ *  - Summary incluye bankBalance/cashBalance y métricas separadas
+ */
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -56,7 +70,7 @@ function centsToEur(cents) {
   if (cents === null || cents === undefined) return null;
   const n = Number(cents);
   if (!Number.isFinite(n)) return null;
-  return Math.round(n) / 100;
+  return n / 100;
 }
 
 function toPeriodKey(d = new Date()) {
@@ -86,6 +100,66 @@ function addDays(date, n) {
   const d = new Date(date);
   d.setDate(d.getDate() + n);
   return d;
+}
+
+// Determina la "cuenta" de una transacción normal
+function resolveAccount({ type, direction, payment_method }) {
+  // Gastos normales: según método
+  if (type === "EXPENSE" && direction === "OUT") {
+    return payment_method === "CASH" ? "CASH" : "BANK";
+  }
+  // Ingresos extra por defecto al banco
+  if (type === "EXTRA_INCOME" && direction === "IN") return "BANK";
+
+  // Resto por defecto al banco (safety, etc.)
+  return "BANK";
+}
+
+/**
+ * Auto-sacar efectivo semanal (idempotente)
+ * - Solo si hoy == start_date de la semana
+ * - Si no existe ya CASH_WITHDRAWAL para esa week_id
+ * - Inserta DOBLE apunte: BANK OUT + CASH IN
+ */
+async function ensureWeeklyCashWithdrawal(client, { month, week }) {
+  if (!month || !week) return;
+
+  const today = new Date();
+  const todayDateOnly = toDateOnly(today);
+  if (String(week.start_date) !== todayDateOnly) return;
+
+  const exists = await client.query(
+    `SELECT 1
+     FROM economia.transaction
+     WHERE week_id=$1 AND type='CASH_WITHDRAWAL'
+     LIMIT 1`,
+    [week.id]
+  );
+  if (exists.rows.length) return;
+
+  const group = await client.query(`SELECT gen_random_uuid() AS id`);
+  const transferGroup = group.rows[0].id;
+
+  const amt = Number(week.cash_withdraw_amount || 0); // cents
+  if (!Number.isFinite(amt) || amt <= 0) return;
+
+  // BANK OUT
+  await client.query(
+    `INSERT INTO economia.transaction
+      (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note, account, transfer_group)
+     VALUES
+      (NOW(), $1, 'OUT', 'CASH_WITHDRAWAL', $2, $3, 'HOUSE', 'TRANSFER', 'Sacar efectivo semanal', NULL, 'BANK', $4)`,
+    [amt, month.id, week.id, transferGroup]
+  );
+
+  // CASH IN
+  await client.query(
+    `INSERT INTO economia.transaction
+      (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note, account, transfer_group)
+     VALUES
+      (NOW(), $1, 'IN', 'CASH_WITHDRAWAL', $2, $3, 'HOUSE', 'TRANSFER', 'Sacar efectivo semanal', NULL, 'CASH', $4)`,
+    [amt, month.id, week.id, transferGroup]
+  );
 }
 
 /* ===================== INIT DB ===================== */
@@ -123,6 +197,11 @@ async function initDb() {
           'PIGGYBANK_DEPOSIT'
         );
       END IF;
+
+      -- NUEVO: cuenta origen/destino
+      IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'account' AND typnamespace = 'economia'::regnamespace) THEN
+        CREATE TYPE economia.account AS ENUM ('BANK','CASH');
+      END IF;
     END
     $$;
 
@@ -149,8 +228,8 @@ async function initDb() {
       week_index INT NOT NULL,
       start_date DATE NOT NULL,
       end_date DATE NOT NULL,
-      cash_withdraw_amount INT NOT NULL,            -- cents
-      cash_returned_to_bank_amount INT NOT NULL DEFAULT 0, -- cents
+      cash_withdraw_amount INT NOT NULL,                 -- cents (lo que "sacas" del banco al empezar semana)
+      cash_returned_to_bank_amount INT NOT NULL DEFAULT 0, -- cents (lo que devuelves al banco)
       status economia.week_status NOT NULL DEFAULT 'OPEN',
       closed_at TIMESTAMPTZ NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -207,6 +286,10 @@ async function initDb() {
       attribution economia.attribution NOT NULL,
       payment_method economia.payment_method NOT NULL,
 
+      -- NUEVO:
+      account economia.account NULL,
+      transfer_group UUID NULL,
+
       concept TEXT NULL,
       note TEXT NULL,
 
@@ -216,6 +299,19 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_tx_month_date ON economia.transaction(month_id, date_time);
     CREATE INDEX IF NOT EXISTS idx_tx_type ON economia.transaction(type);
     CREATE INDEX IF NOT EXISTS idx_tx_category ON economia.transaction(category_id);
+    CREATE INDEX IF NOT EXISTS idx_tx_account ON economia.transaction(account);
+    CREATE INDEX IF NOT EXISTS idx_tx_transfer_group ON economia.transaction(transfer_group);
+  `);
+
+  // Backfill account si venías de antes
+  await pool.query(`
+    UPDATE economia.transaction
+    SET account =
+      CASE
+        WHEN payment_method = 'CASH' AND direction='OUT' AND type='EXPENSE' THEN 'CASH'::economia.account
+        ELSE 'BANK'::economia.account
+      END
+    WHERE account IS NULL;
   `);
 
   // Seed categorías
@@ -258,7 +354,7 @@ async function initDb() {
     ["Hucha normal", "NORMAL"]
   );
 
-  console.log("✅ Economia DB OK (tablas + seed)");
+  console.log("✅ Economia DB OK (tablas + seed + account/backfill)");
 }
 
 initDb().catch((err) => {
@@ -353,8 +449,11 @@ app.get("/week/current", async (_req, res) => {
 });
 
 app.get("/summary/current", async (_req, res) => {
+  const client = await pool.connect();
   try {
-    const m = await pool.query(
+    await client.query("BEGIN");
+
+    const m = await client.query(
       `SELECT
          *,
          (income_amount / 100.0) AS income_amount_eur,
@@ -365,11 +464,14 @@ app.get("/summary/current", async (_req, res) => {
        ORDER BY created_at DESC
        LIMIT 1`
     );
-    if (!m.rows.length) return res.json(null);
+    if (!m.rows.length) {
+      await client.query("COMMIT");
+      return res.json(null);
+    }
 
     const month = m.rows[0];
 
-    const w = await pool.query(
+    const w = await client.query(
       `SELECT
          *,
          (cash_withdraw_amount / 100.0) AS cash_withdraw_amount_eur,
@@ -384,8 +486,11 @@ app.get("/summary/current", async (_req, res) => {
     );
     const week = w.rows[0] || null;
 
-    // Totales del mes (céntimos)
-    const totals = await pool.query(
+    // ✅ NUEVO: auto-tranferencia semanal (lunes)
+    await ensureWeeklyCashWithdrawal(client, { month, week });
+
+    // Totales del mes (céntimos) - GASTOS SOLO EXPENSE
+    const totals = await client.query(
       `SELECT
          COALESCE(SUM(CASE WHEN direction='OUT' AND type='EXPENSE' THEN amount ELSE 0 END),0)::int AS total_expenses,
          COALESCE(SUM(CASE WHEN direction='IN' AND type='EXTRA_INCOME' THEN amount ELSE 0 END),0)::int AS extra_income
@@ -395,17 +500,16 @@ app.get("/summary/current", async (_req, res) => {
     );
 
     const totalExpenses = totals.rows[0].total_expenses; // cents
-    const extraIncome = totals.rows[0].extra_income;     // cents
-
+    const extraIncome = totals.rows[0].extra_income; // cents
     const totalIncome = (month.income_amount || 0) + extraIncome; // cents
-    const remainingMonth = totalIncome - totalExpenses;           // cents
+    const remainingMonth = totalIncome - totalExpenses; // cents
 
-    // Gastado esta semana (céntimos)
+    // Gastado esta semana (céntimos) -> SOLO EXPENSE
     let weekSpent = 0;
     let remainingWeek = null;
 
     if (week) {
-      const ws = await pool.query(
+      const ws = await client.query(
         `SELECT COALESCE(SUM(amount),0)::int AS week_spent
          FROM economia.transaction
          WHERE month_id=$1
@@ -420,7 +524,7 @@ app.get("/summary/current", async (_req, res) => {
     }
 
     // Split por attribution (solo gastos EXPENSE) (céntimos)
-    const split = await pool.query(
+    const split = await client.query(
       `SELECT
          attribution,
          COALESCE(SUM(amount),0)::int AS total
@@ -437,8 +541,54 @@ app.get("/summary/current", async (_req, res) => {
       if (byAttr[r.attribution] !== undefined) byAttr[r.attribution] = r.total;
     }
 
+    // ✅ NUEVO: balances BANK y CASH (cents)
+    const bankAgg = await client.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN account='BANK' AND direction='IN' THEN amount ELSE 0 END),0)::int AS bank_in,
+         COALESCE(SUM(CASE WHEN account='BANK' AND direction='OUT' THEN amount ELSE 0 END),0)::int AS bank_out
+       FROM economia.transaction
+       WHERE month_id=$1`,
+      [month.id]
+    );
+    const cashAgg = await client.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN account='CASH' AND direction='IN' THEN amount ELSE 0 END),0)::int AS cash_in,
+         COALESCE(SUM(CASE WHEN account='CASH' AND direction='OUT' THEN amount ELSE 0 END),0)::int AS cash_out
+       FROM economia.transaction
+       WHERE month_id=$1`,
+      [month.id]
+    );
+
+    const bankIn = bankAgg.rows[0].bank_in;
+    const bankOut = bankAgg.rows[0].bank_out;
+    const cashIn = cashAgg.rows[0].cash_in;
+    const cashOut = cashAgg.rows[0].cash_out;
+
+    // Banco empieza con income_amount (tu ingreso base del mes)
+    const bankBalance = (month.income_amount || 0) + bankIn - bankOut;
+    // Cash empieza en 0 (si quieres arranque con efectivo inicial, lo metes como transfer IN a CASH)
+    const cashBalance = cashIn - cashOut;
+
+    // ✅ NUEVO: gasto semanal en efectivo vs tarjeta (para ver "me queda en bolsillo")
+    let weekCashSpent = 0;
+    let weekBankSpent = 0;
+    if (week) {
+      const wacc = await client.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN type='EXPENSE' AND direction='OUT' AND account='CASH' THEN amount ELSE 0 END),0)::int AS cash_spent,
+           COALESCE(SUM(CASE WHEN type='EXPENSE' AND direction='OUT' AND account='BANK' THEN amount ELSE 0 END),0)::int AS bank_spent
+         FROM economia.transaction
+         WHERE month_id=$1
+           AND date_time::date >= $2::date
+           AND date_time::date <= $3::date`,
+        [month.id, week.start_date, week.end_date]
+      );
+      weekCashSpent = wacc.rows[0].cash_spent;
+      weekBankSpent = wacc.rows[0].bank_spent;
+    }
+
     // Días restantes (incluyendo hoy)
-    const daysLeftQ = await pool.query(
+    const daysLeftQ = await client.query(
       `SELECT GREATEST(1, (economia.month.end_date - CURRENT_DATE + 1))::int AS days_left
        FROM economia.month
        WHERE id=$1`,
@@ -446,8 +596,9 @@ app.get("/summary/current", async (_req, res) => {
     );
     const daysLeft = daysLeftQ.rows[0].days_left;
 
-    // daily pace en cents/día (puede ser decimal, lo devolvemos también en eur)
-    const dailyPace = remainingMonth / daysLeft;
+    const dailyPace = remainingMonth / daysLeft; // cents/día (puede ser decimal)
+
+    await client.query("COMMIT");
 
     res.json({
       month,
@@ -464,6 +615,12 @@ app.get("/summary/current", async (_req, res) => {
         dailyPace,
         byAttr,
 
+        // ✅ NUEVO:
+        bankBalance,
+        cashBalance,
+        weekCashSpent,
+        weekBankSpent,
+
         // eur (para front)
         totalIncome_eur: centsToEur(totalIncome),
         extraIncome_eur: centsToEur(extraIncome),
@@ -477,11 +634,20 @@ app.get("/summary/current", async (_req, res) => {
           PARTNER: centsToEur(byAttr.PARTNER),
           HOUSE: centsToEur(byAttr.HOUSE),
         },
+
+        // ✅ NUEVO:
+        bankBalance_eur: centsToEur(bankBalance),
+        cashBalance_eur: centsToEur(cashBalance),
+        weekCashSpent_eur: centsToEur(weekCashSpent),
+        weekBankSpent_eur: centsToEur(weekBankSpent),
       },
     });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error("❌ Error en GET /summary/current:", error);
     res.status(500).json({ error: "Error obteniendo summary" });
+  } finally {
+    client.release();
   }
 });
 
@@ -520,14 +686,7 @@ app.post("/month/start", async (req, res) => {
          (income_amount / 100.0) AS income_amount_eur,
          (weekly_budget_amount / 100.0) AS weekly_budget_amount_eur,
          (saving_goal_amount / 100.0) AS saving_goal_amount_eur`,
-      [
-        periodKey,
-        toDateOnly(start),
-        toDateOnly(end),
-        incomeCents,
-        weeklyCents,
-        savingCents,
-      ]
+      [periodKey, toDateOnly(start), toDateOnly(end), incomeCents, weeklyCents, savingCents]
     );
 
     const month = monthIns.rows[0];
@@ -605,8 +764,8 @@ app.post("/month/close", async (req, res) => {
     if (toConsolidate > 0) {
       await client.query(
         `INSERT INTO economia.transaction
-          (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note)
-         VALUES (NOW(), $1, 'IN', 'CONSOLIDATE_TO_SAFETY', $2, 'HOUSE', 'TRANSFER', 'Cierre de mes', 'Ahorro objetivo + sobrante')`,
+          (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note, account)
+         VALUES (NOW(), $1, 'IN', 'CONSOLIDATE_TO_SAFETY', $2, 'HOUSE', 'TRANSFER', 'Cierre de mes', 'Ahorro objetivo + sobrante', 'BANK')`,
         [toConsolidate, monthId]
       );
     }
@@ -643,6 +802,9 @@ app.post("/month/close", async (req, res) => {
 });
 
 /* ===================== WEEKS ===================== */
+/**
+ * Devolver efectivo al banco (CASH -> BANK) con doble apunte + update week
+ */
 app.post("/weeks/:id/cash-return", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -657,7 +819,10 @@ app.post("/weeks/:id/cash-return", async (req, res) => {
     await client.query("BEGIN");
 
     const w = await client.query(`SELECT * FROM economia.week WHERE id=$1`, [id]);
-    if (!w.rows.length) return res.status(404).json({ error: "Semana no encontrada" });
+    if (!w.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Semana no encontrada" });
+    }
 
     const week = w.rows[0];
 
@@ -671,11 +836,23 @@ app.post("/weeks/:id/cash-return", async (req, res) => {
       [amountCents, id]
     );
 
+    const group = await client.query(`SELECT gen_random_uuid() AS id`);
+    const transferGroup = group.rows[0].id;
+
+    // CASH OUT
     await client.query(
       `INSERT INTO economia.transaction
-        (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note)
-       VALUES (NOW(), $1, 'IN', 'CASH_RETURN', $2, $3, 'HOUSE', 'CASH', 'Devolver billetes', NULL)`,
-      [amountCents, week.month_id, id]
+        (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note, account, transfer_group)
+       VALUES (NOW(), $1, 'OUT', 'CASH_RETURN', $2, $3, 'HOUSE', 'CASH', 'Devolver sobrante al banco', NULL, 'CASH', $4)`,
+      [amountCents, week.month_id, id, transferGroup]
+    );
+
+    // BANK IN
+    await client.query(
+      `INSERT INTO economia.transaction
+        (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note, account, transfer_group)
+       VALUES (NOW(), $1, 'IN', 'CASH_RETURN', $2, $3, 'HOUSE', 'CASH', 'Devolver sobrante al banco', NULL, 'BANK', $4)`,
+      [amountCents, week.month_id, id, transferGroup]
     );
 
     await client.query("COMMIT");
@@ -723,11 +900,17 @@ app.post("/transactions", async (req, res) => {
       });
     }
 
+    const account = resolveAccount({
+      type: finalType,
+      direction: finalDirection,
+      payment_method,
+    });
+
     const { rows } = await pool.query(
       `INSERT INTO economia.transaction
-        (date_time, amount, direction, type, month_id, week_id, category_id, attribution, payment_method, concept, note)
+        (date_time, amount, direction, type, month_id, week_id, category_id, attribution, payment_method, account, concept, note)
        VALUES
-        (COALESCE($1, NOW()), $2, $3, $4::economia.tx_type, $5, $6, $7, $8::economia.attribution, $9::economia.payment_method, $10, $11)
+        (COALESCE($1, NOW()), $2, $3, $4::economia.tx_type, $5, $6, $7, $8::economia.attribution, $9::economia.payment_method, $10::economia.account, $11, $12)
        RETURNING
          *,
          (amount / 100.0) AS amount_eur`,
@@ -741,6 +924,7 @@ app.post("/transactions", async (req, res) => {
         category_id || null,
         attribution,
         payment_method,
+        account,
         concept && String(concept).trim() ? String(concept).trim() : null,
         note || null,
       ]
@@ -805,15 +989,7 @@ app.put("/transactions/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const {
-      date_time,
-      amount,
-      category_id,
-      attribution,
-      payment_method,
-      concept,
-      note,
-    } = req.body;
+    const { date_time, amount, category_id, attribution, payment_method, concept, note } = req.body;
 
     const amountCents = parseMoneyToCents(amount);
 
@@ -823,6 +999,19 @@ app.put("/transactions/:id", async (req, res) => {
       });
     }
 
+    // Mantén type/direction existentes para recalcular account correctamente
+    const cur = await pool.query(`SELECT type, direction FROM economia.transaction WHERE id=$1`, [id]);
+    if (!cur.rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
+
+    const currentType = cur.rows[0].type;
+    const currentDirection = cur.rows[0].direction;
+
+    const account = resolveAccount({
+      type: currentType,
+      direction: currentDirection,
+      payment_method,
+    });
+
     const { rows } = await pool.query(
       `UPDATE economia.transaction
        SET
@@ -831,9 +1020,10 @@ app.put("/transactions/:id", async (req, res) => {
          category_id = $3,
          attribution = $4::economia.attribution,
          payment_method = $5::economia.payment_method,
-         concept = $6,
-         note = $7
-       WHERE id = $8
+         account = $6::economia.account,
+         concept = $7,
+         note = $8
+       WHERE id = $9
        RETURNING
          *,
          (amount / 100.0) AS amount_eur`,
@@ -843,13 +1033,13 @@ app.put("/transactions/:id", async (req, res) => {
         category_id || null,
         attribution,
         payment_method,
+        account,
         concept && String(concept).trim() ? String(concept).trim() : null,
         note || null,
         id,
       ]
     );
 
-    if (!rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
     res.json(rows[0]);
   } catch (error) {
     console.error("❌ Error en PUT /transactions/:id:", error);
@@ -862,8 +1052,8 @@ app.delete("/transactions/:id", async (req, res) => {
     const { id } = req.params;
 
     const r = await pool.query(`DELETE FROM economia.transaction WHERE id=$1 RETURNING id`, [id]);
-
     if (!r.rows.length) return res.status(404).json({ error: "Movimiento no encontrado" });
+
     res.json({ ok: true });
   } catch (error) {
     console.error("❌ Error en DELETE /transactions/:id:", error);
@@ -888,7 +1078,9 @@ app.post("/piggybanks/:id/entries", async (req, res) => {
     const { amount, note, month_id } = req.body;
 
     const amountCents = parseMoneyToCents(amount);
-    if (!amountCents || amountCents <= 0) return res.status(400).json({ error: "amount es obligatorio (válido)" });
+    if (!amountCents || amountCents <= 0) {
+      return res.status(400).json({ error: "amount es obligatorio (válido)" });
+    }
 
     const { rows } = await pool.query(
       `INSERT INTO economia.piggy_bank_entry (piggy_bank_id, amount, note, month_id)
@@ -903,8 +1095,8 @@ app.post("/piggybanks/:id/entries", async (req, res) => {
     if (month_id) {
       await pool.query(
         `INSERT INTO economia.transaction
-          (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note)
-         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, 'HOUSE', 'CASH', 'Aporte hucha', $3)`,
+          (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note, account)
+         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, 'HOUSE', 'CASH', 'Aporte hucha', $3, 'CASH')`,
         [amountCents, month_id, note || null]
       );
     }
@@ -947,8 +1139,8 @@ app.post("/safety/emergency", async (req, res) => {
 
     const { rows } = await pool.query(
       `INSERT INTO economia.transaction
-        (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note)
-       VALUES (NOW(), $1, 'OUT', 'EMERGENCY_FROM_SAFETY', $2, 'HOUSE', 'TRANSFER', 'Imprevisto', $3)
+        (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note, account)
+       VALUES (NOW(), $1, 'OUT', 'EMERGENCY_FROM_SAFETY', $2, 'HOUSE', 'TRANSFER', 'Imprevisto', $3, 'BANK')
        RETURNING
          *,
          (amount / 100.0) AS amount_eur`,
@@ -991,33 +1183,7 @@ app.get("/safety/history", async (req, res) => {
   }
 });
 
-/* ===================== BORRAR MESES ===================== */
-app.delete("/month/:id", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-
-    await client.query("BEGIN");
-
-    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
-    if (!m.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Mes no encontrado" });
-    }
-
-    await client.query(`DELETE FROM economia.month WHERE id=$1`, [id]);
-
-    await client.query("COMMIT");
-    res.json({ ok: true, deletedMonthId: id });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error en DELETE /month/:id:", error);
-    res.status(500).json({ error: "Error borrando el mes" });
-  } finally {
-    client.release();
-  }
-});
-
+/* ===================== MESES (LIST / UPDATE / DELETE) ===================== */
 app.get("/months", async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -1051,7 +1217,11 @@ app.put("/month/:id", async (req, res) => {
     const { id } = req.params;
     const { incomeAmount, savingGoalAmount, weeklyBudgetAmount } = req.body;
 
-    if (incomeAmount === undefined && savingGoalAmount === undefined && weeklyBudgetAmount === undefined) {
+    if (
+      incomeAmount === undefined &&
+      savingGoalAmount === undefined &&
+      weeklyBudgetAmount === undefined
+    ) {
       return res.status(400).json({
         error: "Debes enviar incomeAmount, savingGoalAmount o weeklyBudgetAmount (al menos uno).",
       });
@@ -1101,6 +1271,7 @@ app.put("/month/:id", async (req, res) => {
       [newIncome, newSaving, newWeekly, id]
     );
 
+    // Si cambia weekly, actualiza semanas OPEN
     if (weeklyBudgetAmount !== undefined && newWeekly !== month.weekly_budget_amount) {
       await client.query(
         `UPDATE economia.week
@@ -1116,6 +1287,32 @@ app.put("/month/:id", async (req, res) => {
     await client.query("ROLLBACK");
     console.error("❌ Error en PUT /month/:id:", error);
     res.status(500).json({ error: "Error actualizando el mes" });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/month/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+
+    await client.query("BEGIN");
+
+    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
+    if (!m.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Mes no encontrado" });
+    }
+
+    await client.query(`DELETE FROM economia.month WHERE id=$1`, [id]);
+
+    await client.query("COMMIT");
+    res.json({ ok: true, deletedMonthId: id });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error en DELETE /month/:id:", error);
+    res.status(500).json({ error: "Error borrando el mes" });
   } finally {
     client.release();
   }
