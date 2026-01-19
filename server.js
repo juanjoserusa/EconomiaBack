@@ -88,11 +88,10 @@ function addDays(date, n) {
   return d;
 }
 
-// ✅ Opción B: crear retirada semanal (bank -> cash) idempotente
+// ✅ Auto-retirada semanal (bank -> cash) idempotente
 async function ensureCashWithdrawalForWeek(client, week) {
   if (!week?.id) return;
 
-  // Si el presupuesto semanal es 0, no hace falta retirar nada
   if (!week.cash_withdraw_amount || week.cash_withdraw_amount <= 0) return;
 
   const exists = await client.query(
@@ -103,7 +102,6 @@ async function ensureCashWithdrawalForWeek(client, week) {
      LIMIT 1`,
     [week.id]
   );
-
   if (exists.rows.length) return;
 
   await client.query(
@@ -112,34 +110,13 @@ async function ensureCashWithdrawalForWeek(client, week) {
      VALUES
       ($1, $2, 'OUT', 'CASH_WITHDRAWAL', $3, $4, 'HOUSE', 'TRANSFER', $5, NULL)`,
     [
-      new Date(week.start_date), // inicio de la semana (en tu tabla puede ser parcial, pero es “la semana vigente”)
+      new Date(week.start_date),
       week.cash_withdraw_amount,
       week.month_id,
       week.id,
       `Retirada efectivo semana ${week.week_index}`,
     ]
   );
-}
-
-async function getCashBalanceForMonth(client, monthId) {
-  const cashAgg = await client.query(
-    `SELECT
-      COALESCE(SUM(CASE WHEN type='CASH_WITHDRAWAL' THEN amount ELSE 0 END),0)::int AS withdraw_in,
-      COALESCE(SUM(CASE WHEN type='CASH_RETURN' THEN amount ELSE 0 END),0)::int AS return_out,
-      COALESCE(SUM(CASE WHEN type='EXPENSE' AND payment_method='CASH' THEN amount ELSE 0 END),0)::int AS cash_expenses_out,
-      COALESCE(SUM(CASE WHEN type='PIGGYBANK_DEPOSIT' AND payment_method='CASH' THEN amount ELSE 0 END),0)::int AS piggy_out
-    FROM economia.transaction
-    WHERE month_id=$1`,
-    [monthId]
-  );
-
-  const cashIn = cashAgg.rows[0].withdraw_in;
-  const cashOut =
-    cashAgg.rows[0].cash_expenses_out +
-    cashAgg.rows[0].return_out +
-    cashAgg.rows[0].piggy_out;
-
-  return cashIn - cashOut; // cents
 }
 
 /* ===================== INIT DB ===================== */
@@ -186,12 +163,12 @@ async function initDb() {
 
     CREATE TABLE IF NOT EXISTS economia.month (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      period_key TEXT UNIQUE NOT NULL, -- 'YYYY-MM'
+      period_key TEXT UNIQUE NOT NULL,
       start_date DATE NOT NULL,
       end_date DATE NOT NULL,
-      income_amount INT NOT NULL,          -- cents
-      weekly_budget_amount INT NOT NULL,   -- cents
-      saving_goal_amount INT NOT NULL,     -- cents
+      income_amount INT NOT NULL,
+      weekly_budget_amount INT NOT NULL,
+      saving_goal_amount INT NOT NULL,
       status economia.month_status NOT NULL DEFAULT 'OPEN',
       closed_at TIMESTAMPTZ NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -203,8 +180,8 @@ async function initDb() {
       week_index INT NOT NULL,
       start_date DATE NOT NULL,
       end_date DATE NOT NULL,
-      cash_withdraw_amount INT NOT NULL,            -- cents
-      cash_returned_to_bank_amount INT NOT NULL DEFAULT 0, -- cents
+      cash_withdraw_amount INT NOT NULL,
+      cash_returned_to_bank_amount INT NOT NULL DEFAULT 0,
       status economia.week_status NOT NULL DEFAULT 'OPEN',
       closed_at TIMESTAMPTZ NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -221,7 +198,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS economia.planned_expense (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name TEXT NOT NULL,
-      amount INT NOT NULL, -- cents
+      amount INT NOT NULL,
       frequency TEXT NOT NULL,
       next_due_date DATE NOT NULL,
       attribution economia.attribution NOT NULL,
@@ -233,7 +210,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS economia.piggy_bank (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name TEXT NOT NULL,
-      type TEXT NOT NULL, -- 'TWO_EURO' | 'NORMAL'
+      type TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (type)
     );
@@ -242,7 +219,7 @@ async function initDb() {
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       piggy_bank_id UUID NOT NULL REFERENCES economia.piggy_bank(id) ON DELETE CASCADE,
       date_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      amount INT NOT NULL, -- cents
+      amount INT NOT NULL,
       note TEXT NULL,
       month_id UUID NULL REFERENCES economia.month(id) ON DELETE SET NULL
     );
@@ -250,7 +227,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS economia.transaction (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       date_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      amount INT NOT NULL CHECK (amount > 0), -- cents
+      amount INT NOT NULL CHECK (amount > 0),
       direction TEXT NOT NULL CHECK (direction IN ('OUT','IN')),
       type economia.tx_type NOT NULL,
 
@@ -264,12 +241,36 @@ async function initDb() {
       concept TEXT NULL,
       note TEXT NULL,
 
+      -- ✅ link entry <-> transaction (para borrar coherente)
+      piggy_entry_id UUID NULL,
+
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE INDEX IF NOT EXISTS idx_tx_month_date ON economia.transaction(month_id, date_time);
     CREATE INDEX IF NOT EXISTS idx_tx_type ON economia.transaction(type);
     CREATE INDEX IF NOT EXISTS idx_tx_category ON economia.transaction(category_id);
+  `);
+
+  // ✅ FK piggy_entry_id (sin romper si ya existe)
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints
+        WHERE constraint_name = 'transaction_piggy_entry_fk'
+          AND table_schema = 'economia'
+          AND table_name = 'transaction'
+      ) THEN
+        ALTER TABLE economia.transaction
+        ADD CONSTRAINT transaction_piggy_entry_fk
+        FOREIGN KEY (piggy_entry_id)
+        REFERENCES economia.piggy_bank_entry(id)
+        ON DELETE CASCADE;
+      END IF;
+    END
+    $$;
   `);
 
   const categories = [
@@ -451,7 +452,7 @@ app.get("/summary/current", async (_req, res) => {
       }
     }
 
-    // Totales del mes (céntimos): GASTOS = EXPENSE (da igual método)
+    // Totales del mes (céntimos): GASTOS = EXPENSE
     const totalsQ = await pool.query(
       `SELECT
          COALESCE(SUM(CASE WHEN direction='OUT' AND type='EXPENSE' THEN amount ELSE 0 END),0)::int AS total_expenses,
@@ -461,12 +462,12 @@ app.get("/summary/current", async (_req, res) => {
       [month.id]
     );
 
-    const totalExpenses = totalsQ.rows[0].total_expenses; // cents
-    const extraIncome = totalsQ.rows[0].extra_income; // cents
-    const totalIncome = (month.income_amount || 0) + extraIncome; // cents
-    const remainingMonth = totalIncome - totalExpenses; // cents
+    const totalExpenses = totalsQ.rows[0].total_expenses;
+    const extraIncome = totalsQ.rows[0].extra_income;
+    const totalIncome = (month.income_amount || 0) + extraIncome;
+    const remainingMonth = totalIncome - totalExpenses;
 
-    // ✅ Semana: SOLO gasto CASH (porque el presupuesto semanal es efectivo)
+    // ✅ Semana: SOLO gasto CASH
     let weekSpentCash = 0;
     let remainingWeekCash = null;
 
@@ -482,11 +483,11 @@ app.get("/summary/current", async (_req, res) => {
            AND date_time::date <= $3::date`,
         [month.id, week.start_date, week.end_date]
       );
-      weekSpentCash = ws.rows[0].week_spent_cash; // cents
-      remainingWeekCash = (week.cash_withdraw_amount || 0) - weekSpentCash; // cents
+      weekSpentCash = ws.rows[0].week_spent_cash;
+      remainingWeekCash = (week.cash_withdraw_amount || 0) - weekSpentCash;
     }
 
-    // Split por attribution (solo gastos EXPENSE) (céntimos) (da igual método, esto es “quién paga”)
+    // Split por attribution (solo EXPENSE)
     const split = await pool.query(
       `SELECT
          attribution,
@@ -515,10 +516,7 @@ app.get("/summary/current", async (_req, res) => {
 
     const dailyPace = remainingMonth / daysLeft;
 
-    // ===================== ✅ BANK vs CASH =====================
-    // bankStart = income_amount + extra_income (todo entra en banco)
-    // bankOut = gastos CARD/TRANSFER + retiradas CASH_WITHDRAWAL
-    // bankIn = devoluciones CASH_RETURN
+    // BANK vs CASH
     const bankAgg = await pool.query(
       `SELECT
         COALESCE(SUM(CASE WHEN type='EXTRA_INCOME' THEN amount ELSE 0 END),0)::int AS extra_in,
@@ -547,21 +545,18 @@ app.get("/summary/current", async (_req, res) => {
     const bankBalance = bankStart + bankIn - bankOut;
 
     const cashIn = cashAgg.rows[0].withdraw_in;
-    const cashOut =
-      cashAgg.rows[0].cash_expenses_out + cashAgg.rows[0].return_out + cashAgg.rows[0].piggy_out;
+    const cashOut = cashAgg.rows[0].cash_expenses_out + cashAgg.rows[0].return_out + cashAgg.rows[0].piggy_out;
     const cashBalance = cashIn - cashOut;
 
     res.json({
       month,
       week,
       totals: {
-        // cents (legacy)
         totalIncome,
         extraIncome,
         totalExpenses,
         remainingMonth,
 
-        // ✅ semana cash
         weekSpent: weekSpentCash,
         remainingWeek: remainingWeekCash,
 
@@ -569,13 +564,11 @@ app.get("/summary/current", async (_req, res) => {
         dailyPace,
         byAttr,
 
-        // eur (para front)
         totalIncome_eur: centsToEur(totalIncome),
         extraIncome_eur: centsToEur(extraIncome),
         totalExpenses_eur: centsToEur(totalExpenses),
         remainingMonth_eur: centsToEur(remainingMonth),
 
-        // ✅ semana cash eur
         weekSpent_eur: centsToEur(weekSpentCash),
         remainingWeek_eur: remainingWeekCash === null ? null : centsToEur(remainingWeekCash),
 
@@ -611,6 +604,7 @@ app.get("/summary/current", async (_req, res) => {
   }
 });
 
+/* ===================== MONTH START/CLOSE/UPDATE/DELETE ===================== */
 app.post("/month/start", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -620,7 +614,6 @@ app.post("/month/start", async (req, res) => {
     const savingCents = parseMoneyToCents(savingGoalAmount);
     const weeklyCents = parseMoneyToCents(weeklyBudgetAmount);
 
-    // ✅ OJO: NO usar !incomeCents (porque 0 es falsy). Aquí queremos > 0, pero validamos bien.
     if (incomeCents === null || savingCents === null || weeklyCents === null) {
       return res.status(400).json({
         error: "incomeAmount, savingGoalAmount y weeklyBudgetAmount son obligatorios (válidos)",
@@ -652,14 +645,7 @@ app.post("/month/start", async (req, res) => {
          (income_amount / 100.0) AS income_amount_eur,
          (weekly_budget_amount / 100.0) AS weekly_budget_amount_eur,
          (saving_goal_amount / 100.0) AS saving_goal_amount_eur`,
-      [
-        periodKey,
-        toDateOnly(start),
-        toDateOnly(end),
-        incomeCents,
-        weeklyCents,
-        savingCents,
-      ]
+      [periodKey, toDateOnly(start), toDateOnly(end), incomeCents, weeklyCents, savingCents]
     );
 
     const month = monthIns.rows[0];
@@ -730,8 +716,8 @@ app.post("/month/close", async (req, res) => {
       [monthId]
     );
 
-    const totalIncome = (month.income_amount || 0) + extra.rows[0].total; // cents
-    const remainder = totalIncome - out.rows[0].total; // cents
+    const totalIncome = (month.income_amount || 0) + extra.rows[0].total;
+    const remainder = totalIncome - out.rows[0].total;
     const toConsolidate = Math.max(0, remainder);
 
     if (toConsolidate > 0) {
@@ -774,8 +760,144 @@ app.post("/month/close", async (req, res) => {
   }
 });
 
-/* ===================== WEEKS ===================== */
+app.get("/months", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         id,
+         period_key,
+         start_date,
+         end_date,
+         income_amount,
+         (income_amount / 100.0) AS income_amount_eur,
+         weekly_budget_amount,
+         (weekly_budget_amount / 100.0) AS weekly_budget_amount_eur,
+         saving_goal_amount,
+         (saving_goal_amount / 100.0) AS saving_goal_amount_eur,
+         status,
+         created_at,
+         closed_at
+       FROM economia.month
+       ORDER BY start_date DESC`
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /months:", error);
+    res.status(500).json({ error: "Error obteniendo meses" });
+  }
+});
 
+app.put("/month/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { incomeAmount, savingGoalAmount, weeklyBudgetAmount } = req.body;
+
+    if (
+      incomeAmount === undefined &&
+      savingGoalAmount === undefined &&
+      weeklyBudgetAmount === undefined
+    ) {
+      return res.status(400).json({
+        error: "Debes enviar incomeAmount, savingGoalAmount o weeklyBudgetAmount (al menos uno).",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
+    if (!m.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Mes no encontrado" });
+    }
+
+    const month = m.rows[0];
+
+    const newIncome =
+      incomeAmount === undefined ? month.income_amount : parseMoneyToCents(incomeAmount);
+    const newSaving =
+      savingGoalAmount === undefined
+        ? month.saving_goal_amount
+        : parseMoneyToCents(savingGoalAmount);
+    const newWeekly =
+      weeklyBudgetAmount === undefined
+        ? month.weekly_budget_amount
+        : parseMoneyToCents(weeklyBudgetAmount);
+
+    if (!Number.isFinite(newIncome) || newIncome < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "incomeAmount inválido" });
+    }
+    if (!Number.isFinite(newSaving) || newSaving < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "savingGoalAmount inválido" });
+    }
+    if (!Number.isFinite(newWeekly) || newWeekly < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "weeklyBudgetAmount inválido" });
+    }
+
+    const up = await client.query(
+      `UPDATE economia.month
+       SET income_amount=$1,
+           saving_goal_amount=$2,
+           weekly_budget_amount=$3
+       WHERE id=$4
+       RETURNING
+         *,
+         (income_amount / 100.0) AS income_amount_eur,
+         (weekly_budget_amount / 100.0) AS weekly_budget_amount_eur,
+         (saving_goal_amount / 100.0) AS saving_goal_amount_eur`,
+      [newIncome, newSaving, newWeekly, id]
+    );
+
+    if (weeklyBudgetAmount !== undefined && newWeekly !== month.weekly_budget_amount) {
+      await client.query(
+        `UPDATE economia.week
+         SET cash_withdraw_amount=$1
+         WHERE month_id=$2 AND status='OPEN'`,
+        [newWeekly, id]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json(up.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error en PUT /month/:id:", error);
+    res.status(500).json({ error: "Error actualizando el mes" });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/month/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+
+    await client.query("BEGIN");
+
+    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
+    if (!m.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Mes no encontrado" });
+    }
+
+    await client.query(`DELETE FROM economia.month WHERE id=$1`, [id]);
+
+    await client.query("COMMIT");
+    res.json({ ok: true, deletedMonthId: id });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error en DELETE /month/:id:", error);
+    res.status(500).json({ error: "Error borrando el mes" });
+  } finally {
+    client.release();
+  }
+});
+
+/* ===================== WEEKS ===================== */
 app.get("/weeks", async (_req, res) => {
   try {
     const m = await pool.query(
@@ -802,158 +924,6 @@ app.get("/weeks", async (_req, res) => {
     res.status(500).json({ error: "Error obteniendo semanas" });
   }
 });
-
-
-app.post("/weeks/:id/close", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-    const { piggyTwoAmount, piggyNormalAmount, returnToBankAmount, note } = req.body;
-
-    const twoCents = parseMoneyToCents(piggyTwoAmount || "0") || 0;
-    const normalCents = parseMoneyToCents(piggyNormalAmount || "0") || 0;
-    const returnCents = parseMoneyToCents(returnToBankAmount || "0") || 0;
-
-    if (twoCents < 0 || normalCents < 0 || returnCents < 0) {
-      return res.status(400).json({ error: "Cantidades inválidas" });
-    }
-
-    const totalMove = twoCents + normalCents + returnCents;
-    if (totalMove <= 0) {
-      return res.status(400).json({ error: "Debes mover algún importe" });
-    }
-
-    await client.query("BEGIN");
-
-    const wq = await client.query(
-      `SELECT * FROM economia.week WHERE id=$1 LIMIT 1`,
-      [id]
-    );
-    if (!wq.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Semana no encontrada" });
-    }
-    const week = wq.rows[0];
-
-    if (week.status !== "OPEN") {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "La semana ya está cerrada" });
-    }
-
-    // ✅ Calcula “bolsillo” disponible EN ESA SEMANA:
-    // cashIn = retiradas (CASH_WITHDRAWAL) dentro de ese month/semana
-    // cashOut = gastos CASH (EXPENSE CASH) + aportes hucha (PIGGYBANK_DEPOSIT CASH) + devoluciones a banco (CASH_RETURN)
-    const cashAgg = await client.query(
-      `SELECT
-        COALESCE(SUM(CASE WHEN type='CASH_WITHDRAWAL' THEN amount ELSE 0 END),0)::int AS cash_in,
-        COALESCE(SUM(CASE WHEN type='EXPENSE' AND payment_method='CASH' THEN amount ELSE 0 END),0)::int AS cash_expense_out,
-        COALESCE(SUM(CASE WHEN type='PIGGYBANK_DEPOSIT' AND payment_method='CASH' THEN amount ELSE 0 END),0)::int AS piggy_out,
-        COALESCE(SUM(CASE WHEN type='CASH_RETURN' THEN amount ELSE 0 END),0)::int AS return_out
-      FROM economia.transaction
-      WHERE month_id=$1 AND week_id=$2`,
-      [week.month_id, week.id]
-    );
-
-    const cashIn = cashAgg.rows[0].cash_in;
-    const cashOut = cashAgg.rows[0].cash_expense_out + cashAgg.rows[0].piggy_out + cashAgg.rows[0].return_out;
-    const cashBalance = cashIn - cashOut;
-
-    if (totalMove > cashBalance) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        error: `No puedes mover más de lo que queda en el bolsillo de esa semana (${centsToEur(cashBalance)}€)`,
-      });
-    }
-
-    // buscar ids de huchas
-    const piggies = await client.query(`SELECT id, type FROM economia.piggy_bank`);
-    const twoPiggy = piggies.rows.find((p) => p.type === "TWO_EURO");
-    const normalPiggy = piggies.rows.find((p) => p.type === "NORMAL");
-
-    // Aporte hucha 2€
-    if (twoCents > 0) {
-      await client.query(
-        `INSERT INTO economia.piggy_bank_entry (piggy_bank_id, amount, note, month_id)
-         VALUES ($1,$2,$3,$4)`,
-        [twoPiggy.id, twoCents, note || null, week.month_id]
-      );
-
-      await client.query(
-        `INSERT INTO economia.transaction
-          (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note)
-         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, $3, 'HOUSE', 'CASH', 'Aporte hucha 2€', $4)`,
-        [twoCents, week.month_id, week.id, note || null]
-      );
-    }
-
-    // Aporte hucha normal
-    if (normalCents > 0) {
-      await client.query(
-        `INSERT INTO economia.piggy_bank_entry (piggy_bank_id, amount, note, month_id)
-         VALUES ($1,$2,$3,$4)`,
-        [normalPiggy.id, normalCents, note || null, week.month_id]
-      );
-
-      await client.query(
-        `INSERT INTO economia.transaction
-          (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note)
-         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, $3, 'HOUSE', 'CASH', 'Aporte hucha normal', $4)`,
-        [normalCents, week.month_id, week.id, note || null]
-      );
-    }
-
-    // Devolver al banco (mueve cash -> bank)
-    if (returnCents > 0) {
-      await client.query(
-        `UPDATE economia.week
-         SET cash_returned_to_bank_amount = cash_returned_to_bank_amount + $1
-         WHERE id=$2`,
-        [returnCents, week.id]
-      );
-
-      await client.query(
-        `INSERT INTO economia.transaction
-          (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note)
-         VALUES (NOW(), $1, 'IN', 'CASH_RETURN', $2, $3, 'HOUSE', 'CASH', 'Cierre semana: vuelve al banco', $4)`,
-        [returnCents, week.month_id, week.id, note || null]
-      );
-    }
-
-    // Cerrar semana
-    await client.query(
-      `UPDATE economia.week
-       SET status='CLOSED', closed_at=NOW()
-       WHERE id=$1`,
-      [week.id]
-    );
-
-    await client.query("COMMIT");
-
-    res.json({
-      ok: true,
-      week_id: week.id,
-      moved: {
-        piggy_two: twoCents,
-        piggy_two_eur: centsToEur(twoCents),
-        piggy_normal: normalCents,
-        piggy_normal_eur: centsToEur(normalCents),
-        return_to_bank: returnCents,
-        return_to_bank_eur: centsToEur(returnCents),
-        total: totalMove,
-        total_eur: centsToEur(totalMove),
-      },
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error en POST /weeks/:id/close:", error);
-    res.status(500).json({ error: "Error cerrando semana" });
-  } finally {
-    client.release();
-  }
-});
-
-
-
 
 app.post("/weeks/:id/cash-return", async (req, res) => {
   const client = await pool.connect();
@@ -1001,7 +971,161 @@ app.post("/weeks/:id/cash-return", async (req, res) => {
   }
 });
 
-/* ===================== ✅ NUEVO: INCOME EXTRA (fácil desde front) ===================== */
+// ✅ Cerrar semana (reparte sobrante)
+app.post("/weeks/:id/close", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { piggyTwoAmount, piggyNormalAmount, returnToBankAmount, note } = req.body;
+
+    const twoCents = parseMoneyToCents(piggyTwoAmount || "0") || 0;
+    const normalCents = parseMoneyToCents(piggyNormalAmount || "0") || 0;
+    const returnCents = parseMoneyToCents(returnToBankAmount || "0") || 0;
+
+    if (twoCents < 0 || normalCents < 0 || returnCents < 0) {
+      return res.status(400).json({ error: "Cantidades inválidas" });
+    }
+
+    const totalMove = twoCents + normalCents + returnCents;
+    if (totalMove <= 0) {
+      return res.status(400).json({ error: "Debes mover algún importe" });
+    }
+
+    // ✅ regla hucha 2€: múltiplos de 2€
+    if (twoCents % 200 !== 0) {
+      return res.status(400).json({ error: "Hucha 2€: solo múltiplos de 2€ (2,4,6...)." });
+    }
+
+    await client.query("BEGIN");
+
+    const wq = await client.query(`SELECT * FROM economia.week WHERE id=$1 LIMIT 1`, [id]);
+    if (!wq.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Semana no encontrada" });
+    }
+    const week = wq.rows[0];
+
+    if (week.status !== "OPEN") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "La semana ya está cerrada" });
+    }
+
+    // ✅ bolsillo semana = retiradas - (gastos cash + piggy + devoluciones)
+    const cashAgg = await client.query(
+      `SELECT
+        COALESCE(SUM(CASE WHEN type='CASH_WITHDRAWAL' THEN amount ELSE 0 END),0)::int AS cash_in,
+        COALESCE(SUM(CASE WHEN type='EXPENSE' AND payment_method='CASH' THEN amount ELSE 0 END),0)::int AS cash_expense_out,
+        COALESCE(SUM(CASE WHEN type='PIGGYBANK_DEPOSIT' AND payment_method='CASH' THEN amount ELSE 0 END),0)::int AS piggy_out,
+        COALESCE(SUM(CASE WHEN type='CASH_RETURN' THEN amount ELSE 0 END),0)::int AS return_out
+      FROM economia.transaction
+      WHERE month_id=$1 AND week_id=$2`,
+      [week.month_id, week.id]
+    );
+
+    const cashIn = cashAgg.rows[0].cash_in;
+    const cashOut = cashAgg.rows[0].cash_expense_out + cashAgg.rows[0].piggy_out + cashAgg.rows[0].return_out;
+    const cashBalance = cashIn - cashOut;
+
+    if (totalMove > cashBalance) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `No puedes mover más de lo que queda en el bolsillo de esa semana (${centsToEur(cashBalance)}€)`,
+      });
+    }
+
+    // ids de huchas
+    const piggies = await client.query(`SELECT id, type FROM economia.piggy_bank`);
+    const twoPiggy = piggies.rows.find((p) => p.type === "TWO_EURO");
+    const normalPiggy = piggies.rows.find((p) => p.type === "NORMAL");
+
+    if (!twoPiggy || !normalPiggy) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: "No existen huchas seed en DB" });
+    }
+
+    // Aporte hucha 2€
+    if (twoCents > 0) {
+      const entry = await client.query(
+        `INSERT INTO economia.piggy_bank_entry (piggy_bank_id, amount, note, month_id)
+         VALUES ($1,$2,$3,$4)
+         RETURNING id`,
+        [twoPiggy.id, twoCents, note || null, week.month_id]
+      );
+
+      await client.query(
+        `INSERT INTO economia.transaction
+          (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note, piggy_entry_id)
+         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, $3, 'HOUSE', 'CASH', 'Aporte hucha 2€', $4, $5)`,
+        [twoCents, week.month_id, week.id, note || null, entry.rows[0].id]
+      );
+    }
+
+    // Aporte hucha normal
+    if (normalCents > 0) {
+      const entry = await client.query(
+        `INSERT INTO economia.piggy_bank_entry (piggy_bank_id, amount, note, month_id)
+         VALUES ($1,$2,$3,$4)
+         RETURNING id`,
+        [normalPiggy.id, normalCents, note || null, week.month_id]
+      );
+
+      await client.query(
+        `INSERT INTO economia.transaction
+          (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note, piggy_entry_id)
+         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, $3, 'HOUSE', 'CASH', 'Aporte hucha normal', $4, $5)`,
+        [normalCents, week.month_id, week.id, note || null, entry.rows[0].id]
+      );
+    }
+
+    // Devolver al banco
+    if (returnCents > 0) {
+      await client.query(
+        `UPDATE economia.week
+         SET cash_returned_to_bank_amount = cash_returned_to_bank_amount + $1
+         WHERE id=$2`,
+        [returnCents, week.id]
+      );
+
+      await client.query(
+        `INSERT INTO economia.transaction
+          (date_time, amount, direction, type, month_id, week_id, attribution, payment_method, concept, note)
+         VALUES (NOW(), $1, 'IN', 'CASH_RETURN', $2, $3, 'HOUSE', 'CASH', 'Cierre semana: vuelve al banco', $4)`,
+        [returnCents, week.month_id, week.id, note || null]
+      );
+    }
+
+    // cerrar semana
+    await client.query(
+      `UPDATE economia.week SET status='CLOSED', closed_at=NOW() WHERE id=$1`,
+      [week.id]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      week_id: week.id,
+      moved: {
+        piggy_two: twoCents,
+        piggy_two_eur: centsToEur(twoCents),
+        piggy_normal: normalCents,
+        piggy_normal_eur: centsToEur(normalCents),
+        return_to_bank: returnCents,
+        return_to_bank_eur: centsToEur(returnCents),
+        total: totalMove,
+        total_eur: centsToEur(totalMove),
+      },
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error en POST /weeks/:id/close:", error);
+    res.status(500).json({ error: "Error cerrando semana" });
+  } finally {
+    client.release();
+  }
+});
+
+/* ===================== INCOME EXTRA ===================== */
 app.post("/income/extra", async (req, res) => {
   try {
     const { month_id, amount, attribution, concept, note } = req.body;
@@ -1065,9 +1189,7 @@ app.post("/transactions", async (req, res) => {
     const finalDirection = direction || (finalType === "EXTRA_INCOME" ? "IN" : "OUT");
 
     if (finalType === "EXPENSE" && !category_id) {
-      return res.status(400).json({
-        error: "category_id es obligatorio cuando type=EXPENSE",
-      });
+      return res.status(400).json({ error: "category_id es obligatorio cuando type=EXPENSE" });
     }
 
     const { rows } = await pool.query(
@@ -1211,17 +1333,54 @@ app.delete("/transactions/:id", async (req, res) => {
 });
 
 /* ===================== PIGGYBANKS ===================== */
-app.get("/piggybanks", async (_req, res) => {
+app.get("/piggybanks/summary", async (_req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT * FROM economia.piggy_bank ORDER BY type ASC`);
+    const { rows } = await pool.query(`
+      SELECT
+        p.id,
+        p.name,
+        p.type,
+        COALESCE(SUM(e.amount), 0)::int AS balance,
+        (COALESCE(SUM(e.amount), 0) / 100.0) AS balance_eur,
+        COUNT(e.id)::int AS entries_count,
+        MAX(e.date_time) AS last_entry_at
+      FROM economia.piggy_bank p
+      LEFT JOIN economia.piggy_bank_entry e ON e.piggy_bank_id = p.id
+      GROUP BY p.id, p.name, p.type
+      ORDER BY p.type ASC
+    `);
+
     res.json(rows);
   } catch (error) {
-    console.error("❌ Error en GET /piggybanks:", error);
-    res.status(500).json({ error: "Error obteniendo huchas" });
+    console.error("❌ Error en GET /piggybanks/summary:", error);
+    res.status(500).json({ error: "Error obteniendo resumen de huchas" });
   }
 });
 
+app.get("/piggybanks/:id/entries", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `SELECT
+         *,
+         (amount / 100.0) AS amount_eur
+       FROM economia.piggy_bank_entry
+       WHERE piggy_bank_id = $1
+       ORDER BY date_time DESC`,
+      [id]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error("❌ Error en GET /piggybanks/:id/entries:", error);
+    res.status(500).json({ error: "Error obteniendo entradas de la hucha" });
+  }
+});
+
+// ✅ crear entry + crear transaction vinculada (y validar TWO_EURO)
 app.post("/piggybanks/:id/entries", async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
     const { amount, note, month_id } = req.body;
@@ -1231,7 +1390,28 @@ app.post("/piggybanks/:id/entries", async (req, res) => {
       return res.status(400).json({ error: "amount es obligatorio (válido)" });
     }
 
-    const { rows } = await pool.query(
+    const pb = await client.query(
+      `SELECT id, type, name
+       FROM economia.piggy_bank
+       WHERE id=$1
+       LIMIT 1`,
+      [id]
+    );
+    if (!pb.rows.length) return res.status(404).json({ error: "Hucha no encontrada" });
+
+    const piggy = pb.rows[0];
+
+    if (piggy.type === "TWO_EURO") {
+      if (amountCents % 200 !== 0) {
+        return res
+          .status(400)
+          .json({ error: "En la hucha 2€ solo se permiten múltiplos de 2€ (2, 4, 6...)." });
+      }
+    }
+
+    await client.query("BEGIN");
+
+    const entryIns = await client.query(
       `INSERT INTO economia.piggy_bank_entry (piggy_bank_id, amount, note, month_id)
        VALUES ($1,$2,$3,$4)
        RETURNING
@@ -1239,21 +1419,60 @@ app.post("/piggybanks/:id/entries", async (req, res) => {
          (amount / 100.0) AS amount_eur`,
       [id, amountCents, note || null, month_id || null]
     );
+    const entry = entryIns.rows[0];
 
-    // tracking como transacción (sale del bolsillo si payment_method CASH)
     if (month_id) {
-      await pool.query(
+      const concept =
+        piggy.type === "TWO_EURO" ? "Aporte hucha 2€" : "Aporte hucha normal";
+
+      await client.query(
         `INSERT INTO economia.transaction
-          (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note)
-         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, 'HOUSE', 'CASH', 'Aporte hucha', $3)`,
-        [amountCents, month_id, note || null]
+          (date_time, amount, direction, type, month_id, attribution, payment_method, concept, note, piggy_entry_id)
+         VALUES (NOW(), $1, 'OUT', 'PIGGYBANK_DEPOSIT', $2, 'HOUSE', 'CASH', $3, $4, $5)`,
+        [amountCents, month_id, concept, note || null, entry.id]
       );
     }
 
-    res.json(rows[0]);
+    await client.query("COMMIT");
+    res.json(entry);
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error("❌ Error en POST /piggybanks/:id/entries:", error);
     res.status(500).json({ error: "Error creando entrada en hucha" });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ borrar entry (y se borra su transaccion vinculada por FK/cascade)
+app.delete("/piggybanks/entries/:entryId", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { entryId } = req.params;
+
+    await client.query("BEGIN");
+
+    const e = await client.query(
+      `SELECT id FROM economia.piggy_bank_entry WHERE id=$1 LIMIT 1`,
+      [entryId]
+    );
+    if (!e.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Entrada no encontrada" });
+    }
+
+    // borramos también la transacción vinculada explícitamente por seguridad
+    await client.query(`DELETE FROM economia.transaction WHERE piggy_entry_id=$1`, [entryId]);
+    await client.query(`DELETE FROM economia.piggy_bank_entry WHERE id=$1`, [entryId]);
+
+    await client.query("COMMIT");
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("❌ Error en DELETE /piggybanks/entries/:entryId:", error);
+    res.status(500).json({ error: "Error borrando entrada de hucha" });
+  } finally {
+    client.release();
   }
 });
 
@@ -1329,182 +1548,6 @@ app.get("/safety/history", async (req, res) => {
   } catch (error) {
     console.error("❌ Error en GET /safety/history:", error);
     res.status(500).json({ error: "Error obteniendo histórico del fondo" });
-  }
-});
-
-/* ===================== BORRAR MESES ===================== */
-app.delete("/month/:id", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-
-    await client.query("BEGIN");
-
-    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
-    if (!m.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Mes no encontrado" });
-    }
-
-    await client.query(`DELETE FROM economia.month WHERE id=$1`, [id]);
-
-    await client.query("COMMIT");
-    res.json({ ok: true, deletedMonthId: id });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error en DELETE /month/:id:", error);
-    res.status(500).json({ error: "Error borrando el mes" });
-  } finally {
-    client.release();
-  }
-});
-
-app.get("/months", async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT
-         id,
-         period_key,
-         start_date,
-         end_date,
-         income_amount,
-         (income_amount / 100.0) AS income_amount_eur,
-         weekly_budget_amount,
-         (weekly_budget_amount / 100.0) AS weekly_budget_amount_eur,
-         saving_goal_amount,
-         (saving_goal_amount / 100.0) AS saving_goal_amount_eur,
-         status,
-         created_at,
-         closed_at
-       FROM economia.month
-       ORDER BY start_date DESC`
-    );
-    res.json(rows);
-  } catch (error) {
-    console.error("❌ Error en GET /months:", error);
-    res.status(500).json({ error: "Error obteniendo meses" });
-  }
-});
-
-app.put("/month/:id", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-    const { incomeAmount, savingGoalAmount, weeklyBudgetAmount } = req.body;
-
-    if (incomeAmount === undefined && savingGoalAmount === undefined && weeklyBudgetAmount === undefined) {
-      return res.status(400).json({
-        error: "Debes enviar incomeAmount, savingGoalAmount o weeklyBudgetAmount (al menos uno).",
-      });
-    }
-
-    await client.query("BEGIN");
-
-    const m = await client.query(`SELECT * FROM economia.month WHERE id=$1`, [id]);
-    if (!m.rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Mes no encontrado" });
-    }
-
-    const month = m.rows[0];
-
-    const newIncome =
-      incomeAmount === undefined ? month.income_amount : parseMoneyToCents(incomeAmount);
-    const newSaving =
-      savingGoalAmount === undefined ? month.saving_goal_amount : parseMoneyToCents(savingGoalAmount);
-    const newWeekly =
-      weeklyBudgetAmount === undefined ? month.weekly_budget_amount : parseMoneyToCents(weeklyBudgetAmount);
-
-    if (!Number.isFinite(newIncome) || newIncome < 0) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "incomeAmount inválido" });
-    }
-    if (!Number.isFinite(newSaving) || newSaving < 0) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "savingGoalAmount inválido" });
-    }
-    if (!Number.isFinite(newWeekly) || newWeekly < 0) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ error: "weeklyBudgetAmount inválido" });
-    }
-
-    const up = await client.query(
-      `UPDATE economia.month
-       SET income_amount=$1,
-           saving_goal_amount=$2,
-           weekly_budget_amount=$3
-       WHERE id=$4
-       RETURNING
-         *,
-         (income_amount / 100.0) AS income_amount_eur,
-         (weekly_budget_amount / 100.0) AS weekly_budget_amount_eur,
-         (saving_goal_amount / 100.0) AS saving_goal_amount_eur`,
-      [newIncome, newSaving, newWeekly, id]
-    );
-
-    if (weeklyBudgetAmount !== undefined && newWeekly !== month.weekly_budget_amount) {
-      await client.query(
-        `UPDATE economia.week
-         SET cash_withdraw_amount=$1
-         WHERE month_id=$2 AND status='OPEN'`,
-        [newWeekly, id]
-      );
-    }
-
-    await client.query("COMMIT");
-    res.json(up.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("❌ Error en PUT /month/:id:", error);
-    res.status(500).json({ error: "Error actualizando el mes" });
-  } finally {
-    client.release();
-  }
-});
-
-/* =====================  HUCHAS ===================== */
-app.get("/piggybanks/summary", async (_req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT
-        p.id,
-        p.name,
-        p.type,
-        COALESCE(SUM(e.amount), 0)::int AS balance,
-        (COALESCE(SUM(e.amount), 0) / 100.0) AS balance_eur,
-        COUNT(e.id)::int AS entries_count,
-        MAX(e.date_time) AS last_entry_at
-      FROM economia.piggy_bank p
-      LEFT JOIN economia.piggy_bank_entry e ON e.piggy_bank_id = p.id
-      GROUP BY p.id, p.name, p.type
-      ORDER BY p.type ASC
-    `);
-
-    res.json(rows);
-  } catch (error) {
-    console.error("❌ Error en GET /piggybanks/summary:", error);
-    res.status(500).json({ error: "Error obteniendo resumen de huchas" });
-  }
-});
-
-app.get("/piggybanks/:id/entries", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const { rows } = await pool.query(
-      `SELECT
-         *,
-         (amount / 100.0) AS amount_eur
-       FROM economia.piggy_bank_entry
-       WHERE piggy_bank_id = $1
-       ORDER BY date_time DESC`,
-      [id]
-    );
-
-    res.json(rows);
-  } catch (error) {
-    console.error("❌ Error en GET /piggybanks/:id/entries:", error);
-    res.status(500).json({ error: "Error obteniendo entradas de la hucha" });
   }
 });
 
