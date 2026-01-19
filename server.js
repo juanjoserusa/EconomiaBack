@@ -252,22 +252,43 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_tx_category ON economia.transaction(category_id);
   `);
 
-  // ✅ FK piggy_entry_id (sin romper si ya existe)
+  // ✅ MIGRACIÓN IDÉMPOTENTE para DBs ya existentes: columna + índice + FK
   await pool.query(`
     DO $$
     BEGIN
+      -- 1) Columna piggy_entry_id
       IF NOT EXISTS (
         SELECT 1
-        FROM information_schema.table_constraints
-        WHERE constraint_name = 'transaction_piggy_entry_fk'
-          AND table_schema = 'economia'
+        FROM information_schema.columns
+        WHERE table_schema = 'economia'
           AND table_name = 'transaction'
+          AND column_name = 'piggy_entry_id'
       ) THEN
         ALTER TABLE economia.transaction
-        ADD CONSTRAINT transaction_piggy_entry_fk
-        FOREIGN KEY (piggy_entry_id)
-        REFERENCES economia.piggy_bank_entry(id)
-        ON DELETE CASCADE;
+          ADD COLUMN piggy_entry_id UUID NULL;
+      END IF;
+
+      -- 2) FK (si no existe)
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'transaction_piggy_entry_fk'
+      ) THEN
+        ALTER TABLE economia.transaction
+          ADD CONSTRAINT transaction_piggy_entry_fk
+          FOREIGN KEY (piggy_entry_id)
+          REFERENCES economia.piggy_bank_entry(id)
+          ON DELETE CASCADE;
+      END IF;
+
+      -- 3) Índice (si no existe)
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'economia'
+          AND indexname = 'idx_tx_piggy_entry'
+      ) THEN
+        CREATE INDEX idx_tx_piggy_entry ON economia.transaction(piggy_entry_id);
       END IF;
     END
     $$;
@@ -545,7 +566,8 @@ app.get("/summary/current", async (_req, res) => {
     const bankBalance = bankStart + bankIn - bankOut;
 
     const cashIn = cashAgg.rows[0].withdraw_in;
-    const cashOut = cashAgg.rows[0].cash_expenses_out + cashAgg.rows[0].return_out + cashAgg.rows[0].piggy_out;
+    const cashOut =
+      cashAgg.rows[0].cash_expenses_out + cashAgg.rows[0].return_out + cashAgg.rows[0].piggy_out;
     const cashBalance = cashIn - cashOut;
 
     res.json({
@@ -1023,13 +1045,16 @@ app.post("/weeks/:id/close", async (req, res) => {
     );
 
     const cashIn = cashAgg.rows[0].cash_in;
-    const cashOut = cashAgg.rows[0].cash_expense_out + cashAgg.rows[0].piggy_out + cashAgg.rows[0].return_out;
+    const cashOut =
+      cashAgg.rows[0].cash_expense_out + cashAgg.rows[0].piggy_out + cashAgg.rows[0].return_out;
     const cashBalance = cashIn - cashOut;
 
     if (totalMove > cashBalance) {
       await client.query("ROLLBACK");
       return res.status(400).json({
-        error: `No puedes mover más de lo que queda en el bolsillo de esa semana (${centsToEur(cashBalance)}€)`,
+        error: `No puedes mover más de lo que queda en el bolsillo de esa semana (${centsToEur(
+          cashBalance
+        )}€)`,
       });
     }
 
@@ -1095,10 +1120,9 @@ app.post("/weeks/:id/close", async (req, res) => {
     }
 
     // cerrar semana
-    await client.query(
-      `UPDATE economia.week SET status='CLOSED', closed_at=NOW() WHERE id=$1`,
-      [week.id]
-    );
+    await client.query(`UPDATE economia.week SET status='CLOSED', closed_at=NOW() WHERE id=$1`, [
+      week.id,
+    ]);
 
     await client.query("COMMIT");
 
@@ -1422,8 +1446,7 @@ app.post("/piggybanks/:id/entries", async (req, res) => {
     const entry = entryIns.rows[0];
 
     if (month_id) {
-      const concept =
-        piggy.type === "TWO_EURO" ? "Aporte hucha 2€" : "Aporte hucha normal";
+      const concept = piggy.type === "TWO_EURO" ? "Aporte hucha 2€" : "Aporte hucha normal";
 
       await client.query(
         `INSERT INTO economia.transaction
